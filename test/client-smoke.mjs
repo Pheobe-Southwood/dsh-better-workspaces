@@ -144,6 +144,15 @@ assert.equal(dictionaries.dicts.zh['hero.localSuffix'], '（本地）');
 assert.equal(dictionaries.dicts.en['hero.localSuffix'], ' (local)');
 assert.equal(dictionaries.dicts.en['files.conflict'], 'File changed on disk since load');
 assert.equal(dictionaries.dicts.zh['diff.editFile'], '编辑');
+assert.equal(dictionaries.dicts.zh['diff.modeSession'], '本会话');
+assert.equal(dictionaries.dicts.en['diff.modeTask'], 'Task');
+
+// per-session touched-path extraction helpers
+const found = new Set();
+T.collectTouched([{ type: 'tool_use', name: 'Edit', input: { file_path: '/ws/a/b.txt' } }, { type: 'tool_use', name: 'bash', input: { command: 'rm x' } }], found, 0);
+assert.deepEqual([...found], ['/ws/a/b.txt']);
+const norm = T.normalizeTouchedPaths(new Set(['/ws/a/b.txt', 'rel/c.txt', '/other/d.txt']), '/ws');
+assert.deepEqual([...norm].sort(), ['a/b.txt', 'rel/c.txt']);
 
 // staging dictionary keys present in both locales
 assert.equal(dictionaries.dicts.zh['hero.stageHint'], '选定基分支即创建并跳转，草稿随迁');

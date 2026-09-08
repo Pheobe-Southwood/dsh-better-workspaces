@@ -102,6 +102,14 @@ _Avoid_: 只读浏览器
 文件/diff 两视图共用的文本编辑面板：等宽 textarea、脏标记、Ctrl/Cmd+S；保存走 POST /file 的 sha1 CAS——磁盘内容自加载后被改动则 409 冲突，提示重新加载，绝不静默覆盖。
 _Avoid_: 在线 IDE
 
+**任务 diff（task diff）**：
+受管 worktree 会话的默认 diff 模式：merge-base(元数据基, HEAD) 对比工作区（含未跟踪），即该 worktree 自基以来积累的全部变更——Paseo「会话 diff」在 1:1 worktree 模型下的等价物。
+_Avoid_: 会话 diff（歧义：见本会话 diff）
+
+**本会话 diff**：
+共享工作区内的 per-session 近似：未提交 diff 按该会话转录中写文件工具（edit/write/multiedit…）的路径过滤；bash 间接改动不归因（按钮 hint 注明）。git 状态按 cwd 共享，转录是唯一 per-session 信号。
+_Avoid_: 会话 diff（歧义：见任务 diff）
+
 **origin 默认基**：
 基分支选择器的 paseo 语义：origin 行在前且为默认基（refs/remotes/origin/<name>，精确 ref 直切远端头），本地分叉行以「<名>（本地）」+ +N −M 分叉数呈现；裸名 base 仍按 origin 优先回退解析。
 _Avoid_: 本地默认基

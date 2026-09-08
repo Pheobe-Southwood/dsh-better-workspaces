@@ -32,9 +32,15 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 3. **Diff pill + tabs** — a `± +N/−N` pill above the composer (click → jumps
    to the diff tab) and two new conversation tabs: `文件` (order 20) and
    `diff` (order 30) beside 对话/轨迹.
-4. **Diff view** — uncommitted mode (working tree incl. untracked vs HEAD) and
-   committed mode (merge-base(base, HEAD) vs HEAD) with commit list, per-file
-   hunks, whitespace/wrap toggles, plus the paseo action ladder:
+4. **Diff view** — four modes with paseo-parity defaults: `未提交` (working
+   tree incl. untracked vs HEAD), `本会话` (default in shared workspaces: the
+   uncommitted diff filtered to files this session wrote, attributed from its
+   paged session log — git state is per-cwd, the log is the only per-session
+   signal), `任务` (default in managed worktree sessions: merge-base(base,
+   HEAD) vs the working tree incl. untracked = everything this worktree
+   accumulated, i.e. paseo's worktree diff), and `对比基线` (merge-base(base,
+   HEAD) vs HEAD) — all with commit list, per-file hunks, whitespace/wrap
+   toggles, plus the paseo action ladder:
    Commit / Pull / Push / Create PR / Merge PR (squash|merge|rebase, auto) /
    Merge-to-base / Update-from-base / Discard / Archive — every disabled
    action carries a precise localized reason. PR + checks come from one

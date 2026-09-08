@@ -17,7 +17,7 @@ mkdirSync(process.env.DSH_HOME, { recursive: true });
 const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind } = await import('../lib/git.js');
 const { createWorktree, listManagedWorktrees, readMetadata, archiveWorktree, worktreesRoot } = await import('../lib/worktree.js');
 const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
-const { computeDiff, commitDiff } = await import('../lib/diff.js');
+const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
 const { commitAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
@@ -164,6 +164,29 @@ await test('branch divergence facts + exact-ref base (paseo picker parity)', asy
     createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'exact-base-bad', base: 'refs/heads/definitely-missing' }),
     /does not exist/,
   );
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('task diff = the worktree session history (paseo worktree-diff parity)', async () => {
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'task-mode-0001', base: 'main' });
+  // committed change since the base…
+  writeFileSync(join(wt.path, 'task-committed.txt'), 'one\n');
+  git(wt.path, 'add', '-A');
+  git(wt.path, '-c', 'user.email=t@t.example', '-c', 'user.name=t', 'commit', '-m', 'task commit');
+  // …then uncommitted edits + an untracked file on top
+  writeFileSync(join(wt.path, 'task-committed.txt'), 'one\ntwo\n');
+  writeFileSync(join(wt.path, 'task-untracked.txt'), 'fresh\n');
+  const result = await computeDiff(wt.path, { mode: 'task' });
+  assert.ok(result.refs.label.startsWith('task:'));
+  const paths = result.files.map((f) => f.path);
+  assert.ok(paths.includes('task-committed.txt'), 'committed-then-edited file present');
+  assert.ok(paths.includes('task-untracked.txt'), 'untracked file present');
+  const committed = result.files.find((f) => f.path === 'task-committed.txt');
+  assert.equal(committed.additions, 2, 'measured against the base, not HEAD');
+  const refs = await resolveDiffRefs(wt.path, { mode: 'task' });
+  const log = git(wt.path, 'log', '--oneline', `${refs.baseRef}..HEAD`).trim().split('\n');
+  assert.equal(log.length, 1, 'commit pane range is base..HEAD');
+  await assert.rejects(computeDiff(repo, { mode: 'task' }), /task-base-missing/);
   await archiveWorktree(wt.path, { force: true });
 });
 
@@ -419,6 +442,14 @@ await test('api routes over real HTTP', async () => {
     const wws = await get('/worktree-workspaces');
     assert.equal(wws.ok, true);
     assert.deepEqual(wws.items, [{ workspaceId: 'ws-provider-x', path: '/tmp/provider-x' }]);
+
+    // task mode requires managed-worktree metadata
+    const taskPlain = await get(`/diff?cwd=${encodeURIComponent(repo)}&mode=task`);
+    assert.equal(taskPlain.ok, false);
+    assert.equal(taskPlain.error, 'task-base-missing');
+    const taskWt = await get(`/diff?cwd=${encodeURIComponent(wt1.path)}&mode=task`);
+    assert.equal(taskWt.ok, true);
+    assert.ok(taskWt.refs.label.startsWith('task:'));
 
     // POST /file: CAS write with guards
     const editable = join(repo, 'editable.txt');

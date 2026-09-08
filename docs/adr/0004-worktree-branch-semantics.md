@@ -236,3 +236,29 @@ Adopted in full:
 objects and moves `origin/*` tracking refs — working tree, index, and local
 branches are untouched (ours runs with `GIT_OPTIONAL_LOCKS=0` and
 `GIT_TERMINAL_PROMPT=0`, same as paseo's `READ_ONLY_GIT_ENV`).
+
+
+## Amendment 4 (same release): session-scoped diff modes
+
+Paseo's diff tab is per-session because its sessions are 1:1 with worktrees:
+the tab shows that worktree's accumulation since its base. DSH additionally
+allows several sessions per workspace, where git state is shared and cannot
+attribute changes per session. We therefore ship four modes with
+paseo-parity defaults:
+
+- `task` (default in managed worktree sessions): `merge-base(metadata.baseRef,
+  HEAD)` vs the working tree including untracked files — exactly the
+  worktree's accumulation, commits and edits alike. Host route
+  `GET /diff?mode=task`; missing metadata base ref answers
+  `{ok:false,error:"task-base-missing"}` and the client falls back with a
+  localized banner.
+- `session` (default in shared workspaces when non-empty): the uncommitted
+  diff client-side filtered to paths this session wrote, attributed by
+  paging the official session log (`binding(id).session.readPage`) and
+  collecting `edit/write/multiedit/…` tool inputs. Bash-mediated edits are
+  not attributed (stated in the button hint); the mode disables itself when
+  the log cannot be paged.
+- `uncommitted` and `base` as before.
+
+The attribution walker is shape-defensive (depth-capped, name+input scan) so
+transcript encoding changes degrade to "mode unavailable" instead of errors.
