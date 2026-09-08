@@ -131,6 +131,20 @@ assert.equal(T.basenameOf('/a/b/repo/'), 'repo');
 assert.equal(T.basenameOf('/a/b/repo'), 'repo');
 assert.match(T.mnemonicSlug(), /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
 
+// file icon resolver (vendored table + Oklab tone)
+const tsIcon = T.getFileIconSvg('app.ts');
+assert.ok(tsIcon.includes('<svg'), 'ts icon renders svg');
+assert.notEqual(tsIcon, T.getFileIconSvg('no-such-file.xyz'), 'extension maps to its own icon');
+assert.equal(T.getFileIconSvg('README'), T.getFileIconSvg('no-such-file.xyz'), 'unknown falls back to default');
+assert.match(T.desaturateHexColor('#ff0000', 0.65), /^#[0-9a-f]{6}$/);
+assert.notEqual(T.desaturateHexColor('#ff0000', 0.65), '#ff0000');
+
+// new picker/editor dict keys
+assert.equal(dictionaries.dicts.zh['hero.localSuffix'], '（本地）');
+assert.equal(dictionaries.dicts.en['hero.localSuffix'], ' (local)');
+assert.equal(dictionaries.dicts.en['files.conflict'], 'File changed on disk since load');
+assert.equal(dictionaries.dicts.zh['diff.editFile'], '编辑');
+
 // staging dictionary keys present in both locales
 assert.equal(dictionaries.dicts.zh['hero.stageHint'], '选定基分支即创建并跳转，草稿随迁');
 assert.equal(dictionaries.dicts.zh['hero.blockReason'], '正在创建隔离 Worktree…');
