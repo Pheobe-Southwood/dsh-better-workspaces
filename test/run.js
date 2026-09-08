@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
@@ -345,6 +345,11 @@ await test('api routes over real HTTP', async () => {
     const post = async (path, body) =>
       (await fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
 
+    // 400 shapes must carry `message` so the client never shows a generic fallback
+    const bad = await post('/worktrees', {});
+    assert.equal(bad.ok, false);
+    assert.equal(bad.message, 'cwd required');
+
     const detect = await get(`/detect?path=${encodeURIComponent(repo)}`);
     assert.equal(detect.ok, true);
     assert.equal(detect.isGit, true);
@@ -405,6 +410,72 @@ await test('api routes over real HTTP', async () => {
     server.close();
     await hub.dispose();
   }
+});
+
+await test('cleanup sweep: dry-run, guards, archive + workspace delete', async () => {
+  const { createCleanup } = await import('../lib/cleanup.js');
+  const deleted = [];
+  const registryMock = {
+    resolveByPath: async (p) => ({ workspaceId: `ws-${p.split('/').pop()}` }),
+    delete: async (req) => {
+      deleted.push(req && req.workspaceId !== undefined ? req.workspaceId : req);
+      return { ok: true };
+    },
+  };
+  const sessionsMock = (cwds) => ({
+    list: () => ({ ids: cwds.map((c, i) => `s${i}`), byId: Object.fromEntries(cwds.map((c, i) => [`s${i}`, { header: { cwd: c } }])) }),
+  });
+  const mockCtx = {
+    get(name) {
+      if (name === 'sessions') return sessionsMock([]);
+      if (name === 'workspaces') return registryMock;
+      return undefined;
+    },
+  };
+  const cleanup = createCleanup(mockCtx);
+
+  const wtClean = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'clean-sweep-0001' });
+  const wtDirty = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dirty-sweep-0002' });
+  writeFileSync(join(wtDirty.path, 'junk.txt'), 'x\n');
+
+  const dry = await cleanup({ dryRun: true });
+  assert.equal(dry.ok, true, JSON.stringify(dry));
+  assert.ok(dry.archived.some((a) => a.path === wtClean.path && a.dryRun === true));
+  assert.ok(dry.skipped.some((s) => s.path === wtDirty.path && s.reason === 'dirty'));
+  assert.ok(existsSync(wtClean.path), 'dry run must not remove anything');
+
+  const live = await cleanup({});
+  assert.ok(live.archived.some((a) => a.path === wtClean.path && !a.dryRun), JSON.stringify(live));
+  assert.ok(live.skipped.some((s) => s.path === wtDirty.path));
+  assert.ok(!existsSync(wtClean.path), 'archived worktree dir removed');
+  assert.ok(deleted.includes('ws-clean-sweep-0001'), JSON.stringify(deleted));
+  assert.ok(existsSync(wtDirty.path), 'dirty worktree untouched');
+  // wt1 (committed + unpushed) must never be swept
+  assert.ok(live.skipped.some((s) => s.path === wt1.path), 'committed worktree guarded');
+
+  // live session cwd → skipped 'session'
+  const wtSession = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'session-sweep-0003' });
+  const guarded = await createCleanup({
+    get(name) {
+      if (name === 'sessions') return sessionsMock([wtSession.path]);
+      if (name === 'workspaces') return registryMock;
+      return undefined;
+    },
+  })({});
+  assert.ok(guarded.skipped.some((s) => s.path === wtSession.path && s.reason === 'session'));
+  assert.ok(existsSync(wtSession.path));
+
+  // session guard unavailable without opt-in → refuse
+  const refused = await createCleanup({ get: () => undefined })({});
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /allowNoSessionGuard/);
+
+  // archive guard fix: clean fresh worktree (no origin branch) archives non-force
+  const plainArchive = await archiveWorktree(wtSession.path, {});
+  assert.equal(plainArchive.ok, true, JSON.stringify(plainArchive));
+  assert.ok(!existsSync(wtSession.path));
+
+  await archiveWorktree(wtDirty.path, { force: true });
 });
 
 rmSync(scratch, { recursive: true, force: true });
