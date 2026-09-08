@@ -15,6 +15,7 @@ mkdirSync(process.env.DSH_HOME, { recursive: true });
 
 const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind } = await import('../lib/git.js');
 const { createWorktree, listManagedWorktrees, readMetadata, archiveWorktree, worktreesRoot } = await import('../lib/worktree.js');
+const { createAutoNamer, validateBranchSlug, cleanBranchName } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff } = await import('../lib/diff.js');
 const { commitAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
@@ -73,6 +74,20 @@ await test('createWorktree branch-off', async () => {
   const meta = await readMetadata(wt1.path);
   assert.equal(meta.baseRefName, 'main');
   assert.equal(meta.intent, 'branch-off');
+  // explicit name → never an auto-rename candidate (ADR 0004)
+  assert.equal(meta.autoName.status, 'ineligible');
+});
+
+await test('branch-off slug placeholder + autoName pending', async () => {
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'amber-otter-1234' });
+  assert.equal(wt.branch, 'amber-otter-1234');
+  const meta = await readMetadata(wt.path);
+  assert.deepEqual(meta.autoName, { status: 'pending', placeholder: 'amber-otter-1234' });
+  assert.equal(meta.baseRefName, 'main'); // default base
+  // slugless branch-off falls back to a server-side mnemonic
+  const wt2 = await createWorktree({ repoRoot: repo, intent: 'branch-off' });
+  assert.match(wt2.branch, /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
+  assert.equal((await readMetadata(wt2.path)).autoName.status, 'pending');
 });
 
 await test('createWorktree checkout + duplicate copy branch', async () => {
@@ -82,6 +97,124 @@ await test('createWorktree checkout + duplicate copy branch', async () => {
   assert.equal(dup.copiedFrom, 'feature');
   assert.match(dup.branch, /^feature-\d+$/);
   await archiveWorktree(dup.path, { force: true });
+});
+
+/* ---------------- first-message branch auto-rename (ADR 0004) ---------------- */
+
+function mockNamerCtx(streamText) {
+  const handlers = {};
+  return {
+    handlers,
+    get(name) {
+      if (name === 'llm') {
+        return {
+          async *stream(options) {
+            assert.equal(typeof options.provider, 'string');
+            assert.equal(options.purpose, 'better-workspaces-branch-name');
+            yield { type: 'text-delta', text: streamText() };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        };
+      }
+      if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'mock', model: 'mock-1' }) };
+      return undefined;
+    },
+    on(event, fn) {
+      handlers[event] = fn;
+      return () => {};
+    },
+    logger: { info() {}, warn() {} },
+  };
+}
+
+await test('autoname: slug rules + cleaner', async () => {
+  assert.equal(validateBranchSlug('fix-login').valid, true);
+  assert.equal(validateBranchSlug('fix/login-2').valid, true);
+  assert.equal(validateBranchSlug('Fix-Login').valid, false);
+  assert.equal(validateBranchSlug('-lead').valid, false);
+  assert.equal(validateBranchSlug('trail-').valid, false);
+  assert.equal(validateBranchSlug('a--b').valid, false);
+  assert.equal(cleanBranchName('```git\nfix-login-bug\n```'), 'fix-login-bug');
+  assert.equal(cleanBranchName('"Add Dark Mode"'), 'add');
+  assert.equal(cleanBranchName('修复登录'), '');
+  assert.equal(cleanBranchName('  FIX--Login_Bug  '), 'fix-login-bug');
+});
+
+await test('autoname: first-message rename end-to-end', async () => {
+  let reply = 'fix-login-bug';
+  const ctx = mockNamerCtx(() => reply);
+  const namer = createAutoNamer(ctx, null);
+  assert.equal(typeof ctx.handlers['session/event'], 'function');
+
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'brave-falcon-abcd' });
+  const session = { id: 's-test', header: { cwd: wt.path } };
+  const event = {
+    type: 'user/message',
+    seq: 1,
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我修复登录 bug' }] },
+  };
+
+  ctx.handlers['session/event'](session, event);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'fix-login-bug');
+  const meta = await readMetadata(wt.path);
+  assert.equal(meta.branch, 'fix-login-bug');
+  assert.equal(meta.autoName.status, 'renamed');
+  assert.equal(meta.autoName.placeholder, 'brave-falcon-abcd');
+
+  // one-shot: a later message never renames again
+  reply = 'something-else';
+  await namer.attempt(session, 'second message');
+  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'fix-login-bug');
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('autoname: guards (manual rename, invalid output, collision, subagent, non-worktree)', async () => {
+  let reply = 'should-not-apply';
+  const ctx = mockNamerCtx(() => reply);
+  const namer = createAutoNamer(ctx, null);
+
+  // manual rename before the first message → attempted, branch untouched
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'calm-heron-1111' });
+  git(wt.path, 'branch', '-m', 'calm-heron-1111', 'my-manual-name');
+  await namer.attempt({ id: 's2', header: { cwd: wt.path } }, 'hello');
+  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'my-manual-name');
+  assert.equal((await readMetadata(wt.path)).autoName.status, 'attempted');
+
+  // invalid model output (non-latin) → placeholder kept, one-shot consumed
+  const wt2 = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dusty-lynx-2222' });
+  reply = '修复登录问题';
+  await namer.attempt({ id: 's3', header: { cwd: wt2.path } }, 'hello');
+  assert.equal(git(wt2.path, 'branch', '--show-current').trim(), 'dusty-lynx-2222');
+  assert.equal((await readMetadata(wt2.path)).autoName.status, 'attempted');
+
+  // collision with an existing branch → -2 suffix (paseo findAvailableBranchName)
+  const wt3 = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'eager-otter-3333' });
+  reply = 'feature';
+  await namer.attempt({ id: 's4', header: { cwd: wt3.path } }, 'hello');
+  assert.equal(git(wt3.path, 'branch', '--show-current').trim(), 'feature-2');
+
+  // subagent sessions never trigger
+  let called = false;
+  const ctx2 = mockNamerCtx(() => {
+    called = true;
+    return 'nope';
+  });
+  createAutoNamer(ctx2, null);
+  const wt4 = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'fierce-wolf-4444' });
+  ctx2.handlers['session/event'](
+    { id: 's5', header: { cwd: wt4.path, parentSession: 'parent-1' } },
+    { type: 'user/message', seq: 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] } },
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(called, false);
+  assert.equal(git(wt4.path, 'branch', '--show-current').trim(), 'fierce-wolf-4444');
+
+  // plain repo cwd (outside worktrees root) → ignored even with pending-looking metadata
+  await namer.attempt({ id: 's6', header: { cwd: repo } }, 'hello');
+  assert.equal(git(repo, 'branch', '--show-current').trim(), 'main');
+
+  for (const p of [wt.path, wt2.path, wt3.path, wt4.path]) await archiveWorktree(p, { force: true });
 });
 
 await test('listManagedWorktrees', async () => {
