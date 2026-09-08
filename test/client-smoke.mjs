@@ -154,6 +154,22 @@ assert.equal(T.draftTextOf({ querySelector: () => null }), '');
 
 assert.match(T.mnemonicSlug(), /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
 
+// hook-order regression guard: no hook call after HeroControl's early return
+const heroStart = source.indexOf('function HeroControl()');
+const heroEnd = source.indexOf('function createHeroInjector()');
+assert.ok(heroStart >= 0 && heroEnd > heroStart, 'HeroControl slice found');
+const hero = source.slice(heroStart, heroEnd);
+const earlyReturn = hero.indexOf('return null;');
+assert.ok(earlyReturn > 0, 'early return present');
+const lastHook = Math.max(
+  hero.lastIndexOf('useState('),
+  hero.lastIndexOf('useEffect('),
+  hero.lastIndexOf('useSyncExternalStore('),
+  hero.lastIndexOf('react.useRef('),
+  hero.lastIndexOf('react.useEffect('),
+);
+assert.ok(lastHook < earlyReturn, 'HeroControl: every hook runs before the early return');
+
 // staging dictionary keys present in both locales
 assert.equal(dictionaries.dicts.zh['hero.stageHint'], '发送首条消息时自动创建');
 assert.equal(dictionaries.dicts.en['hero.stageCreateFallback'], 'Create now');
