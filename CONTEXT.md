@@ -13,8 +13,12 @@ _Avoid_: 项目、目录
 _Avoid_: 工作路径
 
 **预备区（hero）**：
-空白会话在首条消息之前的暂存状态：在此选定工作区、worktree 策略与 agent 预设。worktree 下拉仅出现在这里。
+空白会话在首条消息之前的暂存状态：在此选定工作区、worktree 策略与 agent 预设。worktree 下拉仅出现在这里；选定「新建 worktree」与基分支只是暂存意图，不产生任何副作用。
 _Avoid_: 首页、欢迎页
+
+**首送创建（create-on-first-send）**：
+暂存 worktree 意图后，空白会话的第一次发送被拦截：先创建 worktree 与工作区、跳转新会话、把首条消息投递进去（paseo 的"创建请求携带 firstAgentContext"在 DSH 的等价物）。草稿含附件或锚点缺失时降级为面板内「立即创建」按钮。
+_Avoid_: 点击即创建
 
 **本地检出（「本地」）**：
 工作区根目录就是仓库自身工作副本（而非链接 worktree）的状态，也是 worktree 下拉的默认选项。

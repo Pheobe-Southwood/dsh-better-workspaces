@@ -104,3 +104,51 @@ Adopt paseo semantics in two phases.
 - Tests pin the semantics: placeholder/pending metadata, explicit-name
   ineligibility, end-to-end rename through the subscription, manual-rename /
   invalid-output / collision / subagent / non-worktree guards, slug rules.
+
+## Amendment 1 (same release): deferred creation on first send
+
+The Phase A menu still created the worktree at click time (immediately, or on
+branch pick). Browser acceptance exposed two failures of that shape:
+
+1. Exploratory clicks registered a Workspace + blank session per click — the
+   sidebar filled with mnemonic-named rows the user never asked for (the
+   client `workspaces.create` hardcodes the title to the directory basename,
+   i.e. the mnemonic slug).
+2. `openWorkspaceFor` raced the push-synced workspace list snapshot:
+   `uiWorkspace.connectWorkspace` reads that snapshot synchronously and
+   threw `unknown workspace …` right after a successful create — worktree
+   and workspace existed, the jump never happened, and the hero showed a
+   red error.
+
+Paseo's actual shape (re-verified against `new-workspace-screen`): the
+creation request is submitted **together with the first agent context** —
+selection alone creates nothing. DSH cannot attach creation to session
+spawn (the blank session already exists with an immutable cwd), so the
+client now intercepts the composer's first send instead:
+
+- capture-phase `keydown` (Enter) / `click` (send-button candidate:
+  enabled, svg-bearing, geometrically bottom-right button of the composer
+  block) listeners, gated on staging armed + blank session + non-empty
+  draft + no attachment chips;
+- on intercept: create (mnemonic placeholder, staged base or explicit
+  name) → poll the workspace snapshot (3 s) → connect/create session →
+  open → `workspaces.rename` the workspace title from the first prompt
+  line (paseo-style prompt-derived titles; `-2` on name conflict) →
+  `conversation.sendSession(newSessionId, text, [])` delivers the
+  intercepted message into the new session;
+- degradation matrix: attachment chips in the draft → intercept skipped,
+  panel warns and offers the always-present `立即创建 / Create now`
+  fallback button; composer anchors absent → same fallback button; any
+  async failure → exact `{message}|{error}` text in the hero, draft
+  preserved for retry.
+
+Consequences: zero side effects from selection alone; the sidebar row is
+titled from the prompt from the first second; the first message runs in
+the worktree session, which also feeds the first-message auto-rename.
+A maintenance sweep (`POST /worktrees/cleanup`, host restart required)
+retires worktrees abandoned by the pre-amendment flow: clean + 0 ahead of
+base + 0 unpushed + not any session cwd, with `dryRun` reporting and an
+explicit opt-in when the session guard is unreadable. The sweep also
+motivated fixing `archiveWorktree`'s unpushed count (no same-name origin
+branch used to mean "every commit is unpushed", blocking non-force
+archive of clean fresh worktrees).

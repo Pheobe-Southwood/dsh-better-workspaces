@@ -7,16 +7,20 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 
 1. **Hero worktree staging** — when the current (blank) session's workspace is
    a git repo, a dropdown appears in the hero row between the workspace chip
-   and the 模式 control: `本地` (default) / `新建 worktree` / `新建
-   worktree（选基分支）…`. *新建 worktree* creates immediately: a new branch
-   is always cut from the base (paseo semantics — picking a branch in the
-   list chooses the **base**, never a checkout), seeded with a mnemonic
-   placeholder name (`amber-otter-3f2a`). The worktree registers as a new
-   Workspace and its blank session opens — sessions never switch directories
-   (ADR 0002). On the first user message of that session, an auxiliary LLM
-   call renames the placeholder branch to a task-shaped slug
-   (`fix-login-bug`); user-chosen names (`＋ 新建分支…`) and manual renames
-   are never touched (ADR 0004).
+   and the 模式 control: `本地` (default) / `新建 worktree`. Picking the
+   latter stages the intent and reveals a base-branch dropdown (default =
+   repo default branch, all local+origin branches, plus “＋ 新建分支…” for
+   an explicit name). **Selection creates nothing**: when you send the first
+   message, the send is intercepted — the worktree is created (new branch
+   cut from the base, mnemonic placeholder name), registered as a Workspace
+   titled from your prompt line, its blank session opened, and the message
+   delivered into it (paseo's create-with-first-agent-context, adapted to
+   DSH's immutable session cwd — ADR 0002/0004). On hosts new enough, the
+   placeholder branch is LLM-renamed from that same message seconds later.
+   Sessions never switch directories; drafts with attachments or missing
+   composer anchors degrade to an explicit `立即创建 / Create now` button.
+   Abandoned worktrees from older builds: `POST /worktrees/cleanup`
+   (`dryRun` first) archives provably-idle ones.
 2. **Sidebar git badges** — session rows stretch vertically; below the title:
    `branch · #PR (green open / purple merged / red closed) · checks pie ring ·
    +N/−N · ↑a↓b (only when non-zero)`. Missing items are omitted.
@@ -37,8 +41,8 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 ## Architecture
 
 - **Host** (`lib/index.js` → `git.js`, `worktree.js`, `autoname.js`,
-  `forge.js`, `diff.js`, `actions.js`, `state.js`, `api.js`): git-CLI
-  primitives behind an 8-way concurrency scheduler; managed worktrees under
+  `cleanup.js`, `forge.js`, `diff.js`, `actions.js`, `state.js`, `api.js`):
+  git-CLI primitives behind an 8-way concurrency scheduler; managed worktrees under
   `~/.dsh/worktrees/<8-char base36 sha256(mainRepoRoot)>/<slug>` with
   `<gitdir>/dsh-worktree/worktree.json` metadata; first-message branch
   auto-rename via `ctx.llm.stream` + `ctx.agentDefaultModel` (both optional —
