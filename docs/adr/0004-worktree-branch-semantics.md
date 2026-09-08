@@ -201,3 +201,38 @@ Consequences: zero DOM-dependence in the creation path; turn 1 always runs
 inside the worktree (session born there); the accepted trade-off is that a
 staged-but-abandoned pick creates one short-lived worktree, retired by the
 sweep instead of living forever.
+
+
+## Amendment 3 (same release): the base is the remote head
+
+Field observation (confirmed against paseo source): even when the local
+`master` lags the remote by dozens of commits, paseo worktrees start from
+the newest remote commit. The mechanism is NOT a create-time fetch —
+paseo never fetches during creation (`worktree-core.ts` contains no fetch;
+its freshness comes from `BACKGROUND_GIT_FETCH_INTERVAL_MS = 180_000` plus
+an immediate fetch when repo observation starts, `workspace-git-service.ts
+:79,:1826`). The mechanism is the picker: *"The origin row goes first
+because it is the default base"* (`new-workspace-picker-item.ts:96`) — the
+default choice sends `refName: refs/remotes/origin/<name>`, and
+`resolveBaseBranchForWorktree` (`utils/worktree.ts`) verifies exact
+`refs/...` values with `rev-parse` and cuts `git worktree add -b <slug>
+--no-track refs/remotes/origin/<name>`. Diverged locals surface as a
+second `<name> (local)` row with `+N −M` divergence labels.
+
+Adopted in full:
+
+- `/branches` entries carry per-side oids plus `localAhead/localBehind`
+  (only diverged pairs pay a `rev-list --left-right --count`).
+- The client picker renders the origin row first as the default base and
+  `<name>（本地）` rows with divergence facts; selections and the default
+  are exact refs. `createWorktree` verifies `refs/...` bases as-is; bare
+  names keep the origin-first fallback (old-client compatibility).
+- Beyond paseo: creation additionally gives `git fetch origin --prune` a
+  bounded 4 s head start when a remote exists (120 s cap, allowFail, race —
+  never blocks or fails creation), so the default base is the remote head
+  as of *now*, not as of the last background cycle.
+
+`git fetch` cannot cause merge conflicts by construction: it only downloads
+objects and moves `origin/*` tracking refs — working tree, index, and local
+branches are untouched (ours runs with `GIT_OPTIONAL_LOCKS=0` and
+`GIT_TERMINAL_PROMPT=0`, same as paseo's `READ_ONLY_GIT_ENV`).

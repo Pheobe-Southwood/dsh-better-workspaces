@@ -1,0 +1,20 @@
+dsh-better-workspaces
+Copyright (c) 2026 the dsh-better-workspaces authors
+
+This product includes material ported from other MIT-licensed projects:
+
+1. File-icon SVG table (`lib/client.js`, section "file icons") — transcribed
+   from material-icon-theme via the paseo project
+   (https://github.com/paseo-dev/paseo, packages/app/src/components/
+   material-file-icons.ts), which itself vendors the icons from
+   material-icon-theme (MIT). The accompanying Oklab desaturation helpers
+   (`desaturateHexColor` and friends) are ported from paseo's
+   packages/app/src/utils/color.ts and packages/app/src/components/
+   file-icon-svg.ts (MIT).
+
+2. Worktree/branch semantics (base-branch-off-remote, mnemonic placeholder
+   slugs, first-message auto-naming, branch-slug validation) are derived
+   from study of the paseo project (MIT) and the dsh-git-worktree project
+   (https://github.com/wloops/dsh-git-worktree, MIT) — see docs/adr/0004.
+
+No endorsement by the original authors is implied.

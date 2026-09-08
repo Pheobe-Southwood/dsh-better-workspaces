@@ -6,20 +6,26 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 ## What it adds
 
 1. **Hero worktree staging** — when the current (blank) session's workspace is
-   a git repo, a dropdown appears in the hero row between the workspace chip
-   and the 模式 control: `本地` (default) / `新建 worktree`. Picking the
-   latter stages the intent and reveals a base-branch dropdown (default =
-   repo default branch, all local+origin branches, plus “＋ 新建分支…” for
-   an explicit name). **Picking a base creates immediately and jumps**
-   (create-on-arm): the worktree is cut from the base with a mnemonic
-   placeholder branch, registered as a Workspace titled `<repo> · <branch>`,
-   and the new blank session opens inside it — session cwd can never be
-   migrated later, so the session is born in the worktree (ADR 0004
-   Amendment 2). Opening the menu or browsing branches stays
-   side-effect-free; on the first user message one LLM call renames the
-   branch to a task slug AND titles the session (hosts after the restart),
-   and the workspace title follows. Abandoned staging leftovers are swept
-   automatically (boot + hourly) or via `POST /worktrees/cleanup`.
+   a git repo, a `本地` dropdown appears in the hero row between the workspace
+   chip and the 模式 control; it offers `新建 worktree`, which reveals the
+   base-branch picker. **The picker speaks exact refs (paseo parity)**: the
+   `origin/<name>` row comes first because it IS the default base — cutting
+   from `refs/remotes/origin/<name>` starts at the true GitHub head even when
+   the local branch lags; diverged locals appear as `<name>（本地）` rows with
+   `+N −M` facts. **Picking a base creates immediately and jumps**
+   (create-on-arm, ADR 0004 Amendment 2): creation gives origin refs a
+   bounded 4 s `git fetch --prune` head start (on top of the 180 s background
+   fetch — paseo itself never fetches at create time), cuts the mnemonic
+   placeholder branch, registers a Workspace titled
+   `<source workspace> · <branch>`, creates the target session, migrates the
+   typed draft through the official conversation-input API, opens it and
+   retires the blank launcher — with full rollback on any failure. On the
+   first user message one LLM call renames the branch to a task slug AND
+   titles the session (hosts after restart), and the workspace title follows
+   as `<source> · <session title>`. Inside a worktree workspace the hero
+   control hides entirely, and the sidebar row trades its folder icon for a
+   branch icon. Abandoned staging leftovers are swept automatically
+   (boot + hourly) or via `POST /worktrees/cleanup`.
 2. **Sidebar git badges** — session rows stretch vertically; below the title:
    `branch · #PR (green open / purple merged / red closed) · checks pie ring ·
    +N/−N · ↑a↓b (only when non-zero)`. Missing items are omitted.
@@ -33,9 +39,16 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    Merge-to-base / Update-from-base / Discard / Archive — every disabled
    action carries a precise localized reason. PR + checks come from one
    batched `gh` GraphQL call (30 s TTL, last-good fallback); PRs poll
-   adaptively (20 s pending / 120 s idle).
-5. **Files view** — lazy directory tree + read-only viewer (text with line
-   numbers, images, binary/too-large notices). No manual editing in v1.
+   adaptively (20 s pending / 120 s idle). Each editable file head carries
+   an `编辑` button opening the shared file editor.
+5. **Files view** — lazy directory tree with material file icons by
+   extension (vendor table + Oklab desaturation ported from paseo, see
+   NOTICE) + viewer (text with line numbers, images, binary/too-large
+   notices) + `编辑` button opening the shared **file editor**: monospace
+   textarea, dirty marker, Ctrl/Cmd+S, saved through `POST /file` with
+   sha1 compare-and-swap (concurrent on-disk change → 409 conflict +
+   reload, never a silent overwrite; containment/size/binary guards,
+   atomic tmp+rename write).
 
 ## Architecture
 

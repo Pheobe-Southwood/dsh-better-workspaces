@@ -95,7 +95,20 @@ _Avoid_: 状态栏、标签行
 输入框上方的 DiffStat 胶囊；点击跳转 diff 视图；无任何变更时隐藏。
 
 **文件视图（「文件」tab）**：
-以会话 cwd 为根的只读文件树与文件查看器。
+以会话 cwd 为根的文件树与文件查看器；文件名左侧按扩展名显示 material 风格图标（经 Oklab 降饱和），文本文件可进入编辑器修改。
+_Avoid_: 只读浏览器
+
+**文件编辑器**：
+文件/diff 两视图共用的文本编辑面板：等宽 textarea、脏标记、Ctrl/Cmd+S；保存走 POST /file 的 sha1 CAS——磁盘内容自加载后被改动则 409 冲突，提示重新加载，绝不静默覆盖。
+_Avoid_: 在线 IDE
+
+**origin 默认基**：
+基分支选择器的 paseo 语义：origin 行在前且为默认基（refs/remotes/origin/<name>，精确 ref 直切远端头），本地分叉行以「<名>（本地）」+ +N −M 分叉数呈现；裸名 base 仍按 origin 优先回退解析。
+_Avoid_: 本地默认基
+
+**源工作区前缀**：
+worktree 工作区标题的出处标记：创建时取发起会话所属工作区的标题（存入元数据 sourceWorkspaceTitle），标题形如「<源工作区> · <分支>」，会话获名后跟随为「<源工作区> · <会话标题>」。
+_Avoid_: 仓库名前缀
 
 **diff 视图（「diff」tab）**：
 承载未提交/已提交两模式 diff、commit 列表与操作面板的会话视图。
