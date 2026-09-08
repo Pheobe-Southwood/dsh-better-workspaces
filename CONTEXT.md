@@ -28,6 +28,18 @@ _Avoid_: 临时目录、副本
 托管 worktree 被切出时所依据的精确 ref，记录在元数据里；是已提交 diff 与超前/落后的比较基线。无记录时回退默认分支。
 _Avoid_: 上游（那是另一个概念）
 
+**基分支选择**：
+hero 分支下拉的语义：所选分支只作为切出的基（base），「新建 worktree」永远切出一个新分支，从不检出既有分支（paseo 语义）。
+_Avoid_: 分支切换
+
+**占位分支（placeholder branch）**：
+未显式命名时新建 worktree 自动切出的助记临时分支名（形容词-名词-4位hex，如 amber-otter-3f2a）；由客户端 slug 播种、服务端兜底生成，记录在元数据 autoName 字段中，是自动重命名的唯一候选。
+_Avoid_: 临时分支、默认分支
+
+**自动重命名（auto-rename）**：
+worktree 会话首条真实用户消息触发的一次性 LLM 辅助命名：把占位分支重命名为任务语义 slug（如 fix-login-bug）。守护链：托管 worktree + autoName 为 pending + 当前分支仍等于占位名 + 非子会话；用户显式命名的分支（ineligible）、已手动改名的分支、任何生成失败都保留占位名且不再重试（一次性 attempted）。重命名成功经 hub 失效由 SSE 推送，徽章与 hero 秒级刷新。
+_Avoid_: 智能命名、自动分支
+
 **上游（upstream）**：
 当前分支配置的远端跟踪分支；决定「未推送」计数与 pull/push 目标。
 _Avoid_: 基线、远端
