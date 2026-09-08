@@ -101,3 +101,29 @@ features and degrades gracefully when absent.
 ```bash
 npm test   # standalone host-layer smoke suite (scratch repo + real HTTP)
 ```
+
+
+## 运维：挂载锚点与重启自检
+
+冷启动与热挂载使用**不同的模块解析锚点**（dsh-app-boot 双锚点设计）：
+
+- 冷启动（`systemctl restart dsh-web`）从共享锚点 `$DSH_HOME/profiles/node_modules`
+  解析 out-of-tree 插件名；
+- `patchReload: live` 的文件监听插入从 profile 目录（`$DSH_HOME/profiles/<name>/`）解析。
+
+因此 `link:` 依赖必须**同时**对两个锚点可见：profile 的 `node_modules` 里有 pnpm
+的 symlink 还不够——共享锚点里也要有同名 symlink（本机已建：
+`/root/.dsh/profiles/node_modules/dsh-better-workspaces`）。缺共享锚点时的症状是
+「重启后插件整行缺席」：GUI 里 hero/徽章/tab 全消失，且
+`/better-workspaces/api/*` 与 `/plugins/??dsh-better-workspaces/client.js` 均 404
+（带认证也 404），而 `dsh --profile web --dump-config` 里行依然存在。
+
+重启后自检三步：
+
+1. `dsh --profile web --dump-config | grep better-workspaces` —— 行在组合树里；
+2. `curl -s http://127.0.0.1:3080/better-workspaces/api/worktree-workspaces` ——
+   期望 `{"ok":true,...}`（404 = 未挂载，检查共享锚点 symlink）；
+3. 刷新 GUI：非 worktree 工作区出现「本地」hero 控制，worktree 工作区隐藏且行图标为分支。
+
+`npm test` 含 `test/mount-check.mjs`：以最小假 ctx 跑遍宿主模块 import 与
+apply（dormant + webServer 两条路径），用于在不动 dsh 进程的前提下暴露挂载期抛错。
