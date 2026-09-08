@@ -4,7 +4,8 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
@@ -129,6 +130,42 @@ function mockNamerCtx(streamText) {
   };
   return out;
 }
+
+await test('branch divergence facts + exact-ref base (paseo picker parity)', async () => {
+  // purpose-made branch pair so no existing branch (main is wt1's measure,
+  // feature is checked out in wt2) is touched: divbr local is one empty
+  // commit ahead of its own remote-tracking ref
+  const sha0 = git(repo, 'rev-parse', 'main').trim();
+  git(repo, 'update-ref', 'refs/remotes/origin/divbr', sha0);
+  const tree = git(repo, 'rev-parse', 'main^{tree}').trim();
+  const advanced = git(repo, 'commit-tree', tree, '-p', sha0, '-m', 'advance divbr').trim();
+  git(repo, 'update-ref', 'refs/heads/divbr', advanced);
+
+  const branches = await listBranches(repo);
+  const divbr = branches.find((b) => b.name === 'divbr');
+  assert.ok(divbr.hasLocal && divbr.hasRemote);
+  assert.equal(divbr.localOid, advanced);
+  assert.equal(divbr.remoteOid, sha0);
+  assert.equal(divbr.localAhead, 1);
+  assert.equal(divbr.localBehind, 0);
+
+  const wt = await createWorktree({
+    repoRoot: repo,
+    intent: 'branch-off',
+    slug: 'exact-base-0001',
+    base: 'refs/remotes/origin/divbr',
+    sourceTitle: '  My Source Workspace  ',
+  });
+  assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), sha0, 'cut from the exact remote ref');
+  const meta = await readMetadata(wt.path);
+  assert.equal(meta.baseRefName, 'divbr');
+  assert.equal(meta.sourceWorkspaceTitle, 'My Source Workspace');
+  await assert.rejects(
+    createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'exact-base-bad', base: 'refs/heads/definitely-missing' }),
+    /does not exist/,
+  );
+  await archiveWorktree(wt.path, { force: true });
+});
 
 await test('autoname: slug rules + cleaner', async () => {
   assert.equal(validateBranchSlug('fix-login').valid, true);
@@ -353,7 +390,9 @@ await test('archive guards + archive', async () => {
 /* ---------------- HTTP layer ---------------- */
 await test('api routes over real HTTP', async () => {
   const hub = createGitStateHub({ onChange: () => {} });
-  const api = createApi(hub);
+  const api = createApi(hub, {
+    worktreeWorkspaces: async () => [{ workspaceId: 'ws-provider-x', path: '/tmp/provider-x' }],
+  });
   const server = http.createServer((req, res) => api.route.handler(req, res));
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
@@ -375,6 +414,41 @@ await test('api routes over real HTTP', async () => {
     const branches = await get(`/branches?cwd=${encodeURIComponent(wt1.path)}`);
     assert.equal(branches.current, 'feature-x');
     assert.ok(branches.branches.length >= 3);
+
+    // worktree-workspaces echoes the provider
+    const wws = await get('/worktree-workspaces');
+    assert.equal(wws.ok, true);
+    assert.deepEqual(wws.items, [{ workspaceId: 'ws-provider-x', path: '/tmp/provider-x' }]);
+
+    // POST /file: CAS write with guards
+    const editable = join(repo, 'editable.txt');
+    writeFileSync(editable, 'one\n');
+    const baseSha = createHash('sha1').update(Buffer.from('one\n')).digest('hex');
+    const casConflict = await post('/file', { cwd: repo, path: 'editable.txt', content: 'two\n', baseSha1: 'deadbeef' });
+    assert.equal(casConflict.ok, false);
+    assert.equal(casConflict.error, 'conflict');
+    assert.equal(readFileSync(editable, 'utf8'), 'one\n', 'conflict must not write');
+    const writeOk = await post('/file', { cwd: repo, path: 'editable.txt', content: 'two\n', baseSha1: baseSha });
+    assert.equal(writeOk.ok, true);
+    assert.equal(readFileSync(editable, 'utf8'), 'two\n');
+    const writeEscape = await post('/file', { cwd: repo, path: '../escape.txt', content: 'x' });
+    assert.equal(writeEscape.ok, false);
+    assert.equal(writeEscape.error, 'path escapes workspace');
+    const writeMissing = await post('/file', { cwd: repo, path: 'definitely-missing.txt', content: 'x' });
+    assert.equal(writeMissing.ok, false);
+    assert.equal(writeMissing.error, 'existing file required');
+    const writeBinary = await post('/file', { cwd: repo, path: 'editable.txt', content: 'a\u0000b' });
+    assert.equal(writeBinary.ok, false);
+    assert.equal(writeBinary.error, 'binary content rejected');
+    rmSync(editable, { force: true });
+
+    // GET /file text carries sha1 for the editor CAS
+    const shaFile = join(repo, 'sha-probe.txt');
+    writeFileSync(shaFile, 'probe\n');
+    const fileGet = await get(`/file?cwd=${encodeURIComponent(repo)}&path=sha-probe.txt`);
+    assert.equal(fileGet.kind, 'text');
+    assert.equal(fileGet.sha1, createHash('sha1').update(Buffer.from('probe\n')).digest('hex'));
+    rmSync(shaFile, { force: true });
 
     const wts = await get(`/worktrees?cwd=${encodeURIComponent(wt1.path)}`);
     assert.ok(wts.items.some((i) => i.path === wt1.path && i.managed));
@@ -432,11 +506,12 @@ await test('api routes over real HTTP', async () => {
 await test('cleanup sweep: dry-run, guards, archive + workspace delete', async () => {
   const { createCleanup } = await import('../lib/cleanup.js');
   const deleted = [];
+  const wsEntities = [];
   const registryMock = {
-    resolveByPath: async (p) => ({ workspaceId: `ws-${p.split('/').pop()}` }),
-    delete: async (req) => {
-      deleted.push(req && req.workspaceId !== undefined ? req.workspaceId : req);
-      return { ok: true };
+    list: () => wsEntities.slice(),
+    delete: (id) => {
+      deleted.push(id);
+      return true;
     },
   };
   const sessionsMock = (cwds) => ({
@@ -445,7 +520,7 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   const mockCtx = {
     get(name) {
       if (name === 'sessions') return sessionsMock([]);
-      if (name === 'workspaces') return registryMock;
+      if (name === 'workspaceRegistry') return registryMock;
       return undefined;
     },
   };
@@ -454,6 +529,10 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   const wtClean = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'clean-sweep-0001' });
   const wtDirty = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dirty-sweep-0002' });
   writeFileSync(join(wtDirty.path, 'junk.txt'), 'x\n');
+  wsEntities.push(
+    { path: wtClean.path, workspaceId: 'ws-clean-sweep-0001' },
+    { path: wtDirty.path, workspaceId: 'ws-dirty-sweep-0002' },
+  );
 
   const dry = await cleanup({ dryRun: true });
   assert.equal(dry.ok, true, JSON.stringify(dry));
@@ -472,10 +551,11 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
 
   // live session cwd → skipped 'session'
   const wtSession = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'session-sweep-0003' });
+  wsEntities.push({ path: wtSession.path, workspaceId: 'ws-session-sweep-0003' });
   const guarded = await createCleanup({
     get(name) {
       if (name === 'sessions') return sessionsMock([wtSession.path]);
-      if (name === 'workspaces') return registryMock;
+      if (name === 'workspaceRegistry') return registryMock;
       return undefined;
     },
   })({});
@@ -499,23 +579,29 @@ await test('cleanup abandoned sweep: blank+old only', async () => {
   const { createCleanup } = await import('../lib/cleanup.js');
   const { patchMetadata } = await import('../lib/worktree.js');
   const deleted = [];
+  const wsEntities = [];
   const registryMock = {
-    resolveByPath: async (p) => ({ workspaceId: `ws-${p.split('/').pop()}` }),
-    delete: async (req) => {
-      deleted.push(req && req.workspaceId !== undefined ? req.workspaceId : req);
-      return { ok: true };
+    list: () => wsEntities.slice(),
+    delete: (id) => {
+      deleted.push(id);
+      return true;
     },
   };
   const mkCtx = (byId) => ({
     get(name) {
       if (name === 'sessions') return { list: () => ({ ids: Object.keys(byId), byId }) };
-      if (name === 'workspaces') return registryMock;
+      if (name === 'workspaceRegistry') return registryMock;
       return undefined;
     },
   });
   const wtOld = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'abandon-old-0001' });
   const wtFresh = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'abandon-fresh-0002' });
   const wtBusy = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'abandon-busy-0003' });
+  wsEntities.push(
+    { path: wtOld.path, workspaceId: 'ws-abandon-old-0001' },
+    { path: wtFresh.path, workspaceId: 'ws-abandon-fresh-0002' },
+    { path: wtBusy.path, workspaceId: 'ws-abandon-busy-0003' },
+  );
   const aged = Date.now() - 3600000;
   for (const target of [wtOld.path, wtBusy.path]) await patchMetadata(target, (m) => ({ ...m, createdAt: aged }));
   const byId = {
@@ -526,6 +612,7 @@ await test('cleanup abandoned sweep: blank+old only', async () => {
   const report = await createCleanup(mkCtx(byId))({ abandoned: true, minAgeMs: 60000 });
   assert.equal(report.ok, true, JSON.stringify(report));
   assert.ok(report.archived.some((a) => a.path === wtOld.path), JSON.stringify(report));
+  assert.ok(report.workspacesDeleted.includes('ws-abandon-old-0001'), JSON.stringify(report.workspacesDeleted));
   assert.ok(report.skipped.some((s) => s.path === wtFresh.path && s.reason === 'young'));
   assert.ok(report.skipped.some((s) => s.path === wtBusy.path && s.reason === 'session'));
   assert.ok(!existsSync(wtOld.path));
