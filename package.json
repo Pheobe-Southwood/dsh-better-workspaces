@@ -1,0 +1,41 @@
+{
+  "name": "dsh-better-workspaces",
+  "description": "Git workspace enhancements for the DeepSeek Harness Web GUI: worktree staging in the hero row, per-session git badges in the sidebar, files & diff conversation views, paseo-style pull/push/PR actions",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "license": "MIT",
+  "files": [
+    "lib",
+    "README.md",
+    "CONTEXT.md",
+    "docs"
+  ],
+  "scripts": {
+    "test": "node test/run.js"
+  }
+}
