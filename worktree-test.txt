@@ -1,6 +1,0 @@
-worktree 功能测试文件
-创建于: 2025-09-08
-用途: 验证 DSH worktree 隔离是否正常
-
-如果能在其他 worktree 看到这个文件，说明 worktree 未生效；
-如果看不到，说明 worktree 隔离正常。

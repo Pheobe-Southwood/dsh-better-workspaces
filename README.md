@@ -77,24 +77,38 @@ See `CONTEXT.md` for the glossary and `docs/adr/` for the design records.
 
 ## Install (web profile)
 
-```bash
-# 1. add the dependency to the profile package (link: keeps source edits live)
-dsh plugin --profile web add link:/path/to/dsh-better-workspaces
+The official `dsh plugin` entry (a thin pnpm forwarder into the profile
+directory) installs this package as a plain profile dependency — it declares
+`dsh.client`, not `dsh.bundle`, so mounting is one patch-layer row:
 
-# 2. mount the plugin row via the patch layer (cordis.patch.yml)
+```bash
+# 1. install into the profile (git spec; plain JS, no build step)
+dsh plugin --profile web add github:Pheobe-Southwood/dsh-better-workspaces
+
+# 2. mount the plugin row via the patch layer
+#    ($DSH_HOME/profiles/web/cordis.patch.yml):
 #    - insert:
 #        - id: better-workspaces
 #          name: dsh-better-workspaces
 
-# 3. install (usually done by step 1)
-dsh plugin --profile web install
+# 3. restart dsh for the cold boot (or let patchReload:live hot-insert the
+#    row into a running process)
 ```
 
-The host half hot-mounts on first patch load, but **host code edits need a
-`dsh` restart** (Node's ESM cache survives patch reloads — ADR 0003);
-client-bundle edits hot-rebuild in the module graph and only need a page
-refresh. Requires `git` ≥ 2.31; `gh` (authenticated) enables PR/checks
-features and degrades gracefully when absent.
+Developing from a local checkout? Use a `link:` spec instead of step 1 —
+source edits stay live for the client half:
+
+```bash
+dsh plugin --profile web add link:/path/to/dsh-better-workspaces
+```
+
+Host code edits need a `dsh` restart (Node's ESM cache survives patch
+reloads — ADR 0003); client-bundle edits hot-rebuild in the module graph and
+only need a page refresh. The row declares `inject: ['webServer']`, so cold
+boot waits for the web server instead of racing it (ADR 0005) — if the UI is
+missing after a restart, run the self-check in the ops section below.
+Requires `git` ≥ 2.31; `gh` (authenticated) enables PR/checks features and
+degrades gracefully when absent.
 
 ## Test
 
