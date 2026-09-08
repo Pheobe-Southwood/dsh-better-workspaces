@@ -10,17 +10,16 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    and the 模式 control: `本地` (default) / `新建 worktree`. Picking the
    latter stages the intent and reveals a base-branch dropdown (default =
    repo default branch, all local+origin branches, plus “＋ 新建分支…” for
-   an explicit name). **Selection creates nothing**: when you send the first
-   message, the send is intercepted — the worktree is created (new branch
-   cut from the base, mnemonic placeholder name), registered as a Workspace
-   titled from your prompt line, its blank session opened, and the message
-   delivered into it (paseo's create-with-first-agent-context, adapted to
-   DSH's immutable session cwd — ADR 0002/0004). On hosts new enough, the
-   placeholder branch is LLM-renamed from that same message seconds later.
-   Sessions never switch directories; drafts with attachments or missing
-   composer anchors degrade to an explicit `立即创建 / Create now` button.
-   Abandoned worktrees from older builds: `POST /worktrees/cleanup`
-   (`dryRun` first) archives provably-idle ones.
+   an explicit name). **Picking a base creates immediately and jumps**
+   (create-on-arm): the worktree is cut from the base with a mnemonic
+   placeholder branch, registered as a Workspace titled `<repo> · <branch>`,
+   and the new blank session opens inside it — session cwd can never be
+   migrated later, so the session is born in the worktree (ADR 0004
+   Amendment 2). Opening the menu or browsing branches stays
+   side-effect-free; on the first user message one LLM call renames the
+   branch to a task slug AND titles the session (hosts after the restart),
+   and the workspace title follows. Abandoned staging leftovers are swept
+   automatically (boot + hourly) or via `POST /worktrees/cleanup`.
 2. **Sidebar git badges** — session rows stretch vertically; below the title:
    `branch · #PR (green open / purple merged / red closed) · checks pie ring ·
    +N/−N · ↑a↓b (only when non-zero)`. Missing items are omitted.

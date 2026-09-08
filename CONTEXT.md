@@ -16,9 +16,9 @@ _Avoid_: 工作路径
 空白会话在首条消息之前的暂存状态：在此选定工作区、worktree 策略与 agent 预设。worktree 下拉仅出现在这里；选定「新建 worktree」与基分支只是暂存意图，不产生任何副作用。
 _Avoid_: 首页、欢迎页
 
-**首送创建（create-on-first-send）**：
-暂存 worktree 意图后，空白会话的第一次发送被拦截：先创建 worktree 与工作区、跳转新会话、把首条消息投递进去（paseo 的"创建请求携带 firstAgentContext"在 DSH 的等价物）。草稿含附件或锚点缺失时降级为面板内「立即创建」按钮。
-_Avoid_: 点击即创建
+**择基创建（create-on-arm）**：
+暂存态下选定基分支（或确认显式分支名、或点「立即创建」）即创建 worktree 与工作区并跳转新会话——会话诞生于 worktree 内，首轮工具即落在新目录（会话 cwd 创建后不可迁移，见 ADR 0004 Amendment 2）。打开菜单与浏览分支零副作用；被遗弃的产物由 abandoned 清扫回收。
+_Avoid_: 首送创建、点击即创建
 
 **本地检出（「本地」）**：
 工作区根目录就是仓库自身工作副本（而非链接 worktree）的状态，也是 worktree 下拉的默认选项。
@@ -41,7 +41,7 @@ _Avoid_: 分支切换
 _Avoid_: 临时分支、默认分支
 
 **自动重命名（auto-rename）**：
-worktree 会话首条真实用户消息触发的一次性 LLM 辅助命名：把占位分支重命名为任务语义 slug（如 fix-login-bug）。守护链：托管 worktree + autoName 为 pending + 当前分支仍等于占位名 + 非子会话；用户显式命名的分支（ineligible）、已手动改名的分支、任何生成失败都保留占位名且不再重试（一次性 attempted）。重命名成功经 hub 失效由 SSE 推送，徽章与 hero 秒级刷新。
+worktree 会话首条真实用户消息触发的一次性 LLM 辅助命名：同一次调用产出 {会话标题, 分支 slug}（paseo 契约），分支经 git branch -m 重命名（如 fix-login-bug），标题经 sessionTitle.rename 应用（取代原生自动标题）。守护链：托管 worktree + autoName 为 pending + 当前分支仍等于占位名 + 非子会话；用户显式命名的分支（ineligible）、已手动改名的分支、任何生成失败都保留占位名且不再重试（一次性 attempted）。重命名成功经 hub 失效由 SSE 推送，徽章与 hero 秒级刷新。
 _Avoid_: 智能命名、自动分支
 
 **上游（upstream）**：

@@ -152,3 +152,52 @@ explicit opt-in when the session guard is unreadable. The sweep also
 motivated fixing `archiveWorktree`'s unpushed count (no same-name origin
 branch used to mean "every commit is unpushed", blocking non-force
 archive of clean fresh worktrees).
+
+## Amendment 2 (same release): create-on-arm; cwd migration proven impossible
+
+Amendment 1's first-send DOM intercept failed in the field (the send never
+got intercepted on the acceptance machine — composer text projection or
+send-control shape differs), and deeper investigation showed the intercept
+could never have achieved the real goal anyway:
+
+1. `Session.header` is detached, deep-frozen creation metadata
+   (`dsh-session` :1237, :1315); no move/relocate API exists.
+2. Persistence enforces identity: track/adopt throws when
+   `meta.cwd !== session.header.cwd` (`dsh-session-persistence` :1436, :1472);
+   the jsonl header line fixes cwd at creation
+   (`dsh-session-persistence-jsonl` :47).
+3. `dsh-api-session-controller.ensureSession` throws `ApiSessionCwdConflict`
+   on cwd mismatch (:265, :418).
+4. Tool cwd is bound at agent composition: bash runs
+   `request.workdir ?? config.cwd ?? process.cwd()` (`dsh-bash-local` :170)
+   with `config.cwd` from the per-agent spawn config
+   (`dsh-agent-loop` :1096-1097). The system prompt's `cwd` variable IS live
+   (`dsh-agent-loop` :1095) — changing only the prompt would tell the model
+   one directory while tools write another.
+5. Therefore the only point where a session's cwd can be chosen is session
+   creation. Paseo's submit-time creation works because its session is born
+   with the first prompt; DSH's blank session pre-exists, so the DSH
+   equivalent of "submit" is the user's explicit base-branch pick.
+
+Final shape:
+
+- **Create-on-arm**: choosing a base branch, confirming an explicit branch
+  name, or pressing `立即创建 / Create now` creates the worktree immediately
+  and jumps. Opening the menu or browsing branches stays side-effect-free.
+- The workspace row is titled `<repo> · <branch>` at creation and follows
+  the session title afterwards (client `workspaces.rename`), so sidebar
+  rows are meaningful from the first second.
+- **One LLM call names both**: the first-message autoname prompt returns a
+  single `{title, branch}` JSON object (paseo's generator contract); the
+  branch goes through the existing rename chain, the title through
+  `sessionTitle.rename` — whose supersede semantics make our call the single
+  title source. Prose replies degrade to branch-only.
+- **Abandoned sweep**: staging leftovers (clean, 0 ahead, 0 unpushed, no
+  non-blank session, older than 30 min) are archived and their workspace
+  rows deleted once 5 s after boot and hourly (`cleanup.js` abandoned mode,
+  `POST /worktrees/cleanup` unchanged for manual/dryRun use).
+
+Consequences: zero DOM-dependence in the creation path; turn 1 always runs
+inside the worktree (session born there); the accepted trade-off is that a
+staged-but-abandoned pick creates one short-lived worktree, retired by the
+sweep instead of living forever.
