@@ -15,7 +15,7 @@ mkdirSync(process.env.DSH_HOME, { recursive: true });
 
 const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind } = await import('../lib/git.js');
 const { createWorktree, listManagedWorktrees, readMetadata, archiveWorktree, worktreesRoot } = await import('../lib/worktree.js');
-const { createAutoNamer, validateBranchSlug, cleanBranchName } = await import('../lib/autoname.js');
+const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff } = await import('../lib/diff.js');
 const { commitAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
@@ -103,8 +103,9 @@ await test('createWorktree checkout + duplicate copy branch', async () => {
 
 function mockNamerCtx(streamText) {
   const handlers = {};
-  return {
+  const out = {
     handlers,
+    titles: [],
     get(name) {
       if (name === 'llm') {
         return {
@@ -117,6 +118,7 @@ function mockNamerCtx(streamText) {
         };
       }
       if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'mock', model: 'mock-1' }) };
+      if (name === 'sessionTitle') return { rename: (session, title) => out.titles.push(title) };
       return undefined;
     },
     on(event, fn) {
@@ -125,6 +127,7 @@ function mockNamerCtx(streamText) {
     },
     logger: { info() {}, warn() {} },
   };
+  return out;
 }
 
 await test('autoname: slug rules + cleaner', async () => {
@@ -138,10 +141,13 @@ await test('autoname: slug rules + cleaner', async () => {
   assert.equal(cleanBranchName('"Add Dark Mode"'), 'add');
   assert.equal(cleanBranchName('修复登录'), '');
   assert.equal(cleanBranchName('  FIX--Login_Bug  '), 'fix-login-bug');
+  assert.deepEqual(parseNamePayload('```json\n{"title":" 修复登录 ","branch":"fix-login"}\n```'), { title: '修复登录', branch: 'fix-login' });
+  assert.deepEqual(parseNamePayload('prose without json'), { title: null, branch: 'prose' });
+  assert.deepEqual(parseNamePayload('{"title":"","branch":"x-y"}'), { title: null, branch: 'x-y' });
 });
 
 await test('autoname: first-message rename end-to-end', async () => {
-  let reply = 'fix-login-bug';
+  let reply = JSON.stringify({ title: '修复登录 bug', branch: 'fix-login-bug' });
   const ctx = mockNamerCtx(() => reply);
   const namer = createAutoNamer(ctx, null);
   assert.equal(typeof ctx.handlers['session/event'], 'function');
@@ -161,11 +167,22 @@ await test('autoname: first-message rename end-to-end', async () => {
   assert.equal(meta.branch, 'fix-login-bug');
   assert.equal(meta.autoName.status, 'renamed');
   assert.equal(meta.autoName.placeholder, 'brave-falcon-abcd');
+  assert.deepEqual(ctx.titles, ['修复登录 bug'], 'same LLM call names the session');
 
   // one-shot: a later message never renames again
   reply = 'something-else';
   await namer.attempt(session, 'second message');
   assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'fix-login-bug');
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('autoname: prose fallback keeps branch-only', async () => {
+  const ctx = mockNamerCtx(() => 'plain-slug-only');
+  const namer = createAutoNamer(ctx, null);
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'golden-vale-9090' });
+  await namer.attempt({ id: 'sf', header: { cwd: wt.path } }, 'hello');
+  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'plain-slug-only');
+  assert.deepEqual(ctx.titles, []);
   await archiveWorktree(wt.path, { force: true });
 });
 
@@ -476,6 +493,44 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   assert.ok(!existsSync(wtSession.path));
 
   await archiveWorktree(wtDirty.path, { force: true });
+});
+
+await test('cleanup abandoned sweep: blank+old only', async () => {
+  const { createCleanup } = await import('../lib/cleanup.js');
+  const { patchMetadata } = await import('../lib/worktree.js');
+  const deleted = [];
+  const registryMock = {
+    resolveByPath: async (p) => ({ workspaceId: `ws-${p.split('/').pop()}` }),
+    delete: async (req) => {
+      deleted.push(req && req.workspaceId !== undefined ? req.workspaceId : req);
+      return { ok: true };
+    },
+  };
+  const mkCtx = (byId) => ({
+    get(name) {
+      if (name === 'sessions') return { list: () => ({ ids: Object.keys(byId), byId }) };
+      if (name === 'workspaces') return registryMock;
+      return undefined;
+    },
+  });
+  const wtOld = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'abandon-old-0001' });
+  const wtFresh = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'abandon-fresh-0002' });
+  const wtBusy = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'abandon-busy-0003' });
+  const aged = Date.now() - 3600000;
+  for (const target of [wtOld.path, wtBusy.path]) await patchMetadata(target, (m) => ({ ...m, createdAt: aged }));
+  const byId = {
+    s1: { header: { cwd: wtOld.path }, blank: true },
+    s2: { header: { cwd: wtFresh.path }, blank: true },
+    s3: { header: { cwd: wtBusy.path }, blank: false },
+  };
+  const report = await createCleanup(mkCtx(byId))({ abandoned: true, minAgeMs: 60000 });
+  assert.equal(report.ok, true, JSON.stringify(report));
+  assert.ok(report.archived.some((a) => a.path === wtOld.path), JSON.stringify(report));
+  assert.ok(report.skipped.some((s) => s.path === wtFresh.path && s.reason === 'young'));
+  assert.ok(report.skipped.some((s) => s.path === wtBusy.path && s.reason === 'session'));
+  assert.ok(!existsSync(wtOld.path));
+  assert.ok(existsSync(wtFresh.path) && existsSync(wtBusy.path));
+  for (const target of [wtFresh.path, wtBusy.path]) await archiveWorktree(target, { force: true });
 });
 
 rmSync(scratch, { recursive: true, force: true });
