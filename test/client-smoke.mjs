@@ -132,7 +132,8 @@ assert.equal(T.basenameOf('/a/b/repo'), 'repo');
 assert.match(T.mnemonicSlug(), /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
 
 // staging dictionary keys present in both locales
-assert.equal(dictionaries.dicts.zh['hero.stageHint'], '选定基分支或点「立即创建」后跳转新会话');
+assert.equal(dictionaries.dicts.zh['hero.stageHint'], '选定基分支即创建并跳转，草稿随迁');
+assert.equal(dictionaries.dicts.zh['hero.blockReason'], '正在创建隔离 Worktree…');
 assert.equal(dictionaries.dicts.en['hero.stageCreateFallback'], 'Create now');
 assert.equal(dictionaries.dicts.zh['hero.modeWorktreePick'], undefined, 'two-item menu: pick variant removed');
 assert.equal(dictionaries.dicts.zh['hero.stageAttachWarn'], undefined, 'attach warning removed with the intercept');
