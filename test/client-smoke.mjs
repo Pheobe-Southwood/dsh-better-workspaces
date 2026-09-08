@@ -119,5 +119,45 @@ const diffView = views.find((v) => v.id === 'diff');
 assert.equal(filesView.label(), '文件');
 assert.equal(diffView.label(), 'diff');
 
+/* ---------------- first-send interception helpers (pure) ---------------- */
+const T = mod.__bwTest;
+assert.ok(T, '__bwTest helpers exported');
+
+function stubBtn(rect, opts = {}) {
+  return {
+    disabled: Boolean(opts.disabled),
+    getBoundingClientRect: () => rect,
+    querySelector: (sel) => (sel === 'svg' ? (opts.svg === false ? null : {}) : null),
+  };
+}
+const btnA = stubBtn({ bottom: 100, right: 300 });
+const btnB = stubBtn({ bottom: 120, right: 280 });
+const btnDisabled = stubBtn({ bottom: 120, right: 280 }, { disabled: true });
+const btnNoSvg = stubBtn({ bottom: 120, right: 280 }, { svg: false });
+assert.equal(T.pickSendCandidate([btnA, btnB, btnDisabled, btnNoSvg]), btnB, 'bottom-right enabled svg button wins');
+assert.equal(T.pickSendCandidate([btnA]), btnA);
+assert.equal(T.pickSendCandidate([]), null);
+
+assert.equal(T.promptTitle('修复 登录\nbug'), '修复 登录');
+assert.equal(T.promptTitle('x'.repeat(60)).length, 40);
+assert.equal(T.promptTitle('   '), 'worktree');
+
+assert.equal(T.failureMessage({ message: 'm' }), 'm');
+assert.equal(T.failureMessage({ ok: false, error: 'cwd required' }), 'cwd required');
+assert.equal(T.failureMessage({ ok: false, error: { message: 'deep' } }), 'deep');
+assert.equal(T.failureMessage({ ok: false }), null);
+
+const textRef = { textContent: '  hi there  ' };
+const blockWithText = { querySelector: (sel) => (sel === '[data-composer-text-ref]' ? textRef : null) };
+assert.equal(T.draftTextOf(blockWithText), 'hi there');
+assert.equal(T.draftTextOf({ querySelector: () => null }), '');
+
+assert.match(T.mnemonicSlug(), /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
+
+// staging dictionary keys present in both locales
+assert.equal(dictionaries.dicts.zh['hero.stageHint'], '发送首条消息时自动创建');
+assert.equal(dictionaries.dicts.en['hero.stageCreateFallback'], 'Create now');
+assert.equal(dictionaries.dicts.zh['hero.modeWorktreePick'], undefined, 'two-item menu: pick variant removed');
+
 console.log('CLIENT SMOKE: ALL PASS');
 process.exit(0);
