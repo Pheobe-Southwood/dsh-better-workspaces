@@ -76,6 +76,16 @@ function fakeCtx({ withWebServer }) {
 
 const plugin = await import('../lib/index.js');
 
+// Cold-boot regression guard: the row MUST declare webServer as a hard
+// dependency. With inject:[] the row activated before the web app provided
+// the service, took the dormant branch, and never registered its routes —
+// every cold boot lost the whole plugin (ADR 0005).
+assert.deepEqual(
+  [...(plugin.inject ?? [])],
+  ['webServer'],
+  'host plugin must inject webServer so cordis waits for it on cold boot',
+);
+
 for (const withWebServer of [false, true]) {
   const { ctx, effects, logs } = fakeCtx({ withWebServer });
   try {
