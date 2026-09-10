@@ -67,3 +67,18 @@ dsh 0.1.5 给 Web GUI 的官方右侧栏加了「文件」面板
   `defaultSeed` 改成「多个条目时优先某个默认类型」，guide 条目可以再加回来。
 - `test/client-smoke.mjs` 现在断言：0 个 `conversation.view`、类型定义不带
   guide、`sidebar.right.pane.tab(.title)` 以定义 id 为 key、`inject` 名单未变。
+
+## Amendment 1 (field request): diff also ships a guide entry
+
+用户要求 diff 与官方「工作区文件」平级，因此 `sidebarDiffDefinition()` 增补了
+`guide: [{ order: 20, title, description, icon }]`：右侧栏「开始」页多出一张
+「代码变更」卡片，点它即在当前 pane 打开 diff（官方的 `+` 控制同样是打开
+「开始」）。
+
+这推翻了本文第 3 条「不注册 guide 条目」的取舍，并明确接受它的代价：
+`defaultSeed` 只在 guide 条目恰好唯一时把某会话首次打开的右侧栏直落该类型，
+现在有两个条目，于是没有历史布局状态的会话会落在「开始」选择页，而不是官方
+「文件」。取舍理由是可发现性——`±` 胶囊藏在输入框上方，「找不到 diff 入口」是
+真实反馈；而选择页本身是官方的导航面，不算破坏性改变。
+
+输入框上方的 `±` 胶囊保留：卡片负责“被看见”，胶囊负责“一键”。

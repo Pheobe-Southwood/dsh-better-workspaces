@@ -38,7 +38,12 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    +N/−N · ↑a↓b (only when non-zero)`. Missing items are omitted.
 3. **Diff pill + right-sidebar page** — a `±` pill above the composer opens the
    diff view as a page tab in dsh's official right Sidebar (the column expands,
-   and an already-open tab is revealed rather than duplicated). The pill stays
+   and an already-open tab is revealed rather than duplicated). The page also
+   carries a guide entry, so the sidebar's `开始` page lists it as a `代码变更`
+   card beside the official `工作区文件` one; because the seed only jumps
+   straight to a type while exactly one guide entry exists, a session whose
+   right column has no stored layout now opens on `开始` instead (ADR 0006
+   Amendment 1). The pill stays
    put for every git session — `+N −N` when there is a diffstat, the changed
    file count when only the tree is dirty, `↑N 未推送` when only unpushed
    commits exist, and the bare `diff` otherwise — because the conversation no
@@ -74,8 +79,10 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
   `~/.dsh/worktrees/<8-char base36 sha256(mainRepoRoot)>/<slug>` with
   `<gitdir>/dsh-worktree/worktree.json` metadata; first-message branch
   auto-rename via `ctx.llm.stream` + `ctx.agentDefaultModel` (both optional —
-  absent services keep placeholders); snapshot hub with fs
-  watchers (1 s debounce, degraded 5 s polling), 180 s background fetch and
+  absent services keep placeholders; its output budget is sized for a reasoning
+  prelude, because a reasoning model spends it before any text exists); snapshot
+  hub with fs watchers (1 s debounce, degraded 5 s polling), 180 s background
+  fetch and
   fingerprint-deduped SSE; HTTP+SSE API on the harness webServer under
   `/better-workspaces/api`.
 - **Client** (`lib/client.js`, hand-written `__ModuleLoader__` bundle):
