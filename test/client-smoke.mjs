@@ -13,6 +13,33 @@ const dshRequire = createRequire(
   '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-trajectory/seed.js',
 );
 
+// A dsh install whose react/react-dom links are pruned or dangling would make
+// this suite unrunnable even though it never RENDERS a component. Keep the
+// real runtime when it resolves; otherwise fall back to the minimal surface
+// the bundle touches at module scope (createElement + hook names) and say so.
+let runtimeRequire = dshRequire;
+try {
+  dshRequire('react');
+  dshRequire('react-dom/client');
+} catch {
+  console.warn('[client-smoke] real react/react-dom not resolvable from the dsh install — using a stub (no component rendering in this suite)');
+  const stubReact = {
+    createElement: (...args) => ({ type: args[0], props: args[1], children: args.slice(2) }),
+    useState: (value) => [value, () => {}],
+    useEffect: () => {},
+    useRef: (value) => ({ current: value }),
+    useCallback: (fn) => fn,
+    useSyncExternalStore: () => null,
+    Fragment: Symbol('Fragment'),
+  };
+  const stubReactDomClient = { createRoot: () => ({ render() {}, unmount() {} }) };
+  runtimeRequire = (spec) => {
+    if (spec === 'react') return stubReact;
+    if (spec === 'react-dom/client') return stubReactDomClient;
+    return dshRequire(spec);
+  };
+}
+
 globalThis.window = globalThis;
 let loadedEntry = null;
 globalThis.__ModuleLoader__ = {
@@ -28,7 +55,7 @@ assert.ok(loadedEntry, 'bundle called __ModuleLoader__.load');
 assert.equal(loadedEntry.id, 'dsh-better-workspaces');
 assert.equal(typeof loadedEntry.factory, 'function');
 
-const mod = loadedEntry.factory((spec) => dshRequire(spec));
+const mod = loadedEntry.factory((spec) => runtimeRequire(spec));
 assert.equal(typeof mod.apply, 'function', 'exports.apply');
 assert.deepEqual(mod.inject, ['slots', 'locale', 'sessions', 'workspaces']);
 
@@ -154,12 +181,38 @@ assert.deepEqual([...found], ['/ws/a/b.txt']);
 const norm = T.normalizeTouchedPaths(new Set(['/ws/a/b.txt', 'rel/c.txt', '/other/d.txt']), '/ws');
 assert.deepEqual([...norm].sort(), ['a/b.txt', 'rel/c.txt']);
 
+/* ---------------- hero mode menu (UI regression) ---------------- */
+const fakeT = (key) => dictionaries.dicts.zh[key] ?? key;
+assert.deepEqual(T.heroModeItems(false, fakeT), [
+  { id: 'local', label: '本地', active: true },
+  { id: 'new', label: '新建 worktree', active: false },
+], 'local mode: 本地 is offered and active, 新建 worktree is offered');
+assert.deepEqual(T.heroModeItems(true, fakeT), [
+  { id: 'local', label: '本地', active: false },
+  { id: 'new', label: '新建 worktree', active: true },
+], 'staging mode: the 本地 escape hatch stays selectable');
+
+/* ---------------- cwd-tagged detection (cross-workspace rename) ---------------- */
+const detectValue = { ok: true, isGit: true, isLinkedWorktree: true, managed: true };
+assert.equal(T.liveDetect(null, '/a'), null, 'no detection yet');
+assert.equal(T.liveDetect(undefined, '/a'), null, 'no detection yet');
+assert.equal(T.liveDetect({ cwd: '/a', value: detectValue }, '/a'), detectValue, 'same-cwd detection is readable');
+// the reported bug: switching sessions rendered the NEW cwd with the OLD
+// detection, whose sourceWorkspaceTitle then renamed an unrelated workspace
+assert.equal(T.liveDetect({ cwd: '/a', value: detectValue }, '/b'), null, 'a detection never crosses cwd');
+assert.equal(T.liveDetect({ cwd: '/a', value: detectValue }, null), null, 'no cwd → no detection');
+assert.equal(T.liveDetect({ cwd: null, value: detectValue }, '/a'), null, 'untagged detection is unusable');
+
 // staging dictionary keys present in both locales
 assert.equal(dictionaries.dicts.zh['hero.stageHint'], '选定基分支即创建并跳转，草稿随迁');
 assert.equal(dictionaries.dicts.zh['hero.blockReason'], '正在创建隔离 Worktree…');
 assert.equal(dictionaries.dicts.en['hero.stageCreateFallback'], 'Create now');
 assert.equal(dictionaries.dicts.zh['hero.modeWorktreePick'], undefined, 'two-item menu: pick variant removed');
 assert.equal(dictionaries.dicts.zh['hero.stageAttachWarn'], undefined, 'attach warning removed with the intercept');
+assert.equal(dictionaries.dicts.zh['hero.modeLocal'], '本地');
+assert.equal(dictionaries.dicts.en['hero.modeLocal'], 'Local');
+assert.equal(dictionaries.dicts.zh['hero.modeWorktree'], '新建 worktree');
+assert.equal(dictionaries.dicts.en['hero.modeWorktree'], 'New worktree');
 
 console.log('CLIENT SMOKE: ALL PASS');
 process.exit(0);

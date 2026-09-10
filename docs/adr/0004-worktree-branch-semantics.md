@@ -262,3 +262,40 @@ paseo-parity defaults:
 
 The attribution walker is shape-defensive (depth-capped, name+input scan) so
 transcript encoding changes degrade to "mode unavailable" instead of errors.
+
+
+## Amendment 5 (field bugfix): the 本地 escape hatch and cwd-tagged detection
+
+Two client defects surfaced in daily use; both are now invariants.
+
+**A. The mode menu must carry `本地`.** ADR 0002 and Phase A above both specify a
+two-item menu (`本地` / `新建 worktree`), but v1 shipped a single item: once
+`新建 worktree` was picked the user sat in the base picker with no way back to
+the local checkout, and the trigger always read `本地` even while staging. The
+menu is again `本地` (default-selected) / `新建 worktree`, selecting `本地`
+resets staging with zero side effects, and the trigger label mirrors the active
+mode. `heroModeItems(staging, t)` is the pure, unit-tested contract.
+
+**B. A git detection result is only valid for the cwd it was resolved for.**
+`/detect` is async per path, and the session switch renders with the NEW cwd
+together with the OLD detection (the detect-reset and title-sync effects run in
+the same commit; the reset only lands on the next render). The title-sync
+effect then combined the old worktree's `sourceWorkspaceTitle` prefix with the
+new session's title and renamed the workspace sitting at the new cwd — observed
+as workspace `dsh-simple-codex-login` becoming
+`dsh-better-workspaces · <new session title>` after merely switching sessions.
+Every detection result is now tagged `{cwd, value}` and read through
+`liveDetect(entry, cwd)`, which returns the value only on a cwd match; the
+same-cwd tagging also covers the one-render window in which the hero control
+would otherwise decide on the wrong repo. Unit-tested.
+
+**C. Provenance rename moves to the very next call after registration.**
+`workspaces.create` accepts `{path}` only (the Remote request carries no title,
+and the Host passes only `request.path` to the registry), so the row is born
+with `defaultWorkspaceTitle(path)` — the placeholder branch name — and used to
+keep it through session create, draft migration, open and archive before the
+`<source> · <branch>` rename landed (the reported "branch name first, prefix
+later" flash). The rename now runs immediately after `workspaces.create`
+resolves, leaving a single RPC round-trip as the only remaining window; a
+host-side titled-create route is the only way to close it completely and is
+deliberately out of scope.
