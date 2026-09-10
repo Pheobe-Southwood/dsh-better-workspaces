@@ -299,3 +299,35 @@ later" flash). The rename now runs immediately after `workspaces.create`
 resolves, leaving a single RPC round-trip as the only remaining window; a
 host-side titled-create route is the only way to close it completely and is
 deliberately out of scope.
+
+## Amendment 6 (field bugfix): the naming budget vs. a reasoning model, and the workspace title that stopped at the fallback
+
+**A. The auxiliary naming call needs an output budget that survives a reasoning
+prelude.** `LLM_MAX_TOKENS` was 64 ("a slug never needs more"), the call ran on
+the session's own route, and reasoning tokens arrive as `reasoning-delta` chunks
+*before* any `text-delta` exists. On deepseek-flash / effort high the reply spent
+all 64 tokens on reasoning, emitted no text and finished `max-tokens`;
+`generateBranchName` accumulated only text, so it returned null and the guarded
+attempt returned in silence with `autoName.status = 'attempted'` already written
+(one-shot by design) — the placeholder branch survived forever. Reproduced in the
+live process by replaying the exact call four ways: 64 tokens with and without
+the plugin's `purpose` string → `max-tokens`, no text; 512 tokens → `stop` with a
+valid `{title, branch}` JSON; 64 tokens with `purpose: 'session-title'` → no
+reasoning at all. dsh's own title call is immune for exactly that last reason,
+and a plugin cannot borrow the policy by naming its purpose differently. The
+budget is now 512, and every remaining bail path logs a warning carrying the
+numbers that identify this failure (finish kind, reasoning-chunk count, text
+length) instead of returning in silence.
+
+**B. The worktree workspace title follows every session title, not just the
+first.** dsh publishes a fallback title derived from the prompt text immediately
+and the model's title about a second later. The one-shot `titleSynced` latch in
+the sidebar-provenance effect consumed the *fallback* and never looked again, so
+managed-worktree rows froze on it (observed:
+`dsh-better-workspaces · 请给dsh-better-workspaces开个中文P` while the session row
+showed its real title). The effect now re-syncs on every title change, remembers
+the last title it attempted, and only rewrites a title it composed itself
+(`<prefix> · …`) so a human's workspace rename is never clobbered. Together with
+the branch rename from the same LLM reply (`sessionTitle.rename` +
+`git branch -m`), one first message now names the session, the branch and the
+workspace.

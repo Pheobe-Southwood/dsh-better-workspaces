@@ -107,13 +107,25 @@ function mockNamerCtx(streamText) {
   const out = {
     handlers,
     titles: [],
+    warnings: [],
     get(name) {
       if (name === 'llm') {
         return {
           async *stream(options) {
             assert.equal(typeof options.provider, 'string');
             assert.equal(options.purpose, 'better-workspaces-branch-name');
-            yield { type: 'text-delta', text: streamText() };
+            // The budget has to survive a reasoning prelude: a reasoning model
+            // spends it on reasoning-delta before any text-delta exists
+            // (ADR 0004 Amendment 6.A — 64 tokens silently produced no slug).
+            assert.ok(options.maxTokens >= 256, `naming budget too small: ${options.maxTokens}`);
+            // a string reply is the common case; an explicit chunk array lets a
+            // test script the reasoning-only / truncated replies
+            const script = streamText();
+            if (Array.isArray(script)) {
+              for (const chunk of script) yield chunk;
+              return;
+            }
+            yield { type: 'text-delta', text: script };
             yield { type: 'finish', reason: { kind: 'stop' } };
           },
         };
@@ -126,7 +138,12 @@ function mockNamerCtx(streamText) {
       handlers[event] = fn;
       return () => {};
     },
-    logger: { info() {}, warn() {} },
+    logger: {
+      info() {},
+      warn(message) {
+        out.warnings.push(String(message));
+      },
+    },
   };
   return out;
 }
@@ -243,6 +260,27 @@ await test('autoname: prose fallback keeps branch-only', async () => {
   await namer.attempt({ id: 'sf', header: { cwd: wt.path } }, 'hello');
   assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'plain-slug-only');
   assert.deepEqual(ctx.titles, []);
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('autoname: a reasoning-only reply keeps the placeholder and says why', async () => {
+  // the field failure of ADR 0004 Amendment 6.A: reasoning tokens outran the
+  // output budget, so the reply carried no text at all
+  const ctx = mockNamerCtx(() => [
+    { type: 'reasoning-delta', text: 'thinking about the prompt' },
+    { type: 'reasoning-delta', text: 'still thinking' },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]);
+  const namer = createAutoNamer(ctx, null);
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'quiet-heron-7777' });
+  await namer.attempt({ id: 's7', header: { cwd: wt.path } }, 'hi');
+  assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'quiet-heron-7777');
+  assert.equal((await readMetadata(wt.path)).autoName.status, 'attempted');
+  assert.deepEqual(ctx.titles, [], 'an empty reply never names the session');
+  assert.ok(
+    ctx.warnings.some((m) => m.includes('max-tokens') && m.includes('reasoning chunks')),
+    `expected a diagnostic warning, saw ${JSON.stringify(ctx.warnings)}`,
+  );
   await archiveWorktree(wt.path, { force: true });
 });
 

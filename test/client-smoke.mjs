@@ -166,11 +166,20 @@ assert.equal(diffType.id, 'dsh-better-workspaces/diff');
 assert.equal(diffType.kind, 'bw-diff');
 assert.equal(diffType.priority, 'extension');
 assert.equal(diffType.title('sidebar://bw-diff'), 'diff');
-assert.equal(
-  diffType.guide,
-  undefined,
-  'no guide entry: a second guide entry would flip the sidebar default seed away from 文件',
+// the guide entry is what offers diff beside the official 工作区文件 capsule —
+// and it is also what flips defaultSeed to the 开始 chooser, because the seed
+// only lands on a type while exactly one guide entry exists (ADR 0006
+// Amendment 1)
+assert.equal(Array.isArray(diffType.guide), true, 'exactly one guide entry');
+assert.equal(diffType.guide.length, 1);
+assert.deepEqual(
+  Object.keys(diffType.guide[0]).sort(),
+  ['description', 'icon', 'order', 'title'],
 );
+assert.equal(diffType.guide[0].order, 20);
+assert.equal(diffType.guide[0].title(), '代码变更');
+assert.equal(diffType.guide[0].description(), '查看本会话的代码变更，并提交 / 推送 / 建 PR');
+assert.equal(typeof diffType.guide[0].icon, 'function', 'the page glyph doubles as the capsule icon');
 
 const sidebarSlots = registrations.filter(
   (r) => r.descriptor && String(r.descriptor.name).startsWith('sidebar.right.pane.tab'),
