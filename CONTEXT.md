@@ -132,3 +132,20 @@ _Avoid_: 按钮组
 
 **Merge-to-base / Update-from-base**：
 把当前分支合入基线分支（基线被其他 worktree 检出时在其 worktree 内执行）/ 把最超前的基线合入当前分支（要求干净工作树）。
+
+## 安装与挂载
+
+**组合包（bundle package）**：
+在 `package.json` 的 `dsh.bundle.patch` 里指向自带 patch 文件的 npm 包；其 patch 成为挂载它的 profile 的一层。`dsh plugin --profile <名> add` 在 pnpm 之后会 reconcile，把这类包自动追加进 `dsh.profile.bundles` —— 这就是「一条命令装完即可用」的全部机制，用户不需要手改 profile 层。
+_Avoid_: npm 包（那是更宽的概念）
+
+**双半包**：
+同一个包同时提供宿主半（`main` → `lib/index.js`，作为 loader 行被挂载）与浏览器半（`exports["./client"]` → `lib/client.js`，由 `dsh.client` 声明、经 `dsh-client-modules` 扫描宿主行后注入页面）。本包既是双半包也声明 `dsh.bundle`：`dsh.bundle` 与 `dsh.client` 是两个独立键，互不冲突。
+
+**挂载行（mount row）**：
+本包自带 `cordis.patch.yml` 里那一行 insert，是插件出现在组合树里的唯一入口。两条一致性约束：`name` 必须是包名（loader 据此从 profile 的 `node_modules` 解析代码），`id` 必须是宿主半导出的 `name`（一行 = 一个插件实例）；`test/mount-check.mjs` 有守卫。
+
+**迁移清理（migration cleanup）**：
+从只声明 `dsh.client` 的旧版本升级时，必须删掉 profile 层里手写的那一行挂载行。`insert` 是原样追加、不按 id 去重，重复 id 由 loader 抛 `duplicate loader entry id` 并 fail-loud —— 两个来源不是「无害的重复」，而是起不来。
+_Avoid_: 兼容处理
+

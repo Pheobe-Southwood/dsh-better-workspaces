@@ -95,38 +95,81 @@ See `CONTEXT.md` for the glossary and `docs/adr/` for the design records.
 
 ## Install (web profile)
 
-The official `dsh plugin` entry (a thin pnpm forwarder into the profile
-directory) installs this package as a plain profile dependency — it declares
-`dsh.client`, not `dsh.bundle`, so mounting is one patch-layer row:
+Prerequisites: `dsh` ≥ 0.1.5 with the `web` profile, `pnpm` on `PATH`, and
+`git` ≥ 2.31. `gh` (authenticated) is optional — it enables the PR/checks
+features and degrades gracefully when absent.
+
+**One command installs and mounts the plugin** (plain JS, no build step):
 
 ```bash
-# 1. install into the profile (git spec; plain JS, no build step)
 dsh plugin --profile web add github:Pheobe-Southwood/dsh-better-workspaces
-
-# 2. mount the plugin row via the patch layer
-#    ($DSH_HOME/profiles/web/cordis.patch.yml):
-#    - insert:
-#        - id: better-workspaces
-#          name: dsh-better-workspaces
-
-# 3. restart dsh for the cold boot (or let patchReload:live hot-insert the
-#    row into a running process)
 ```
 
-Developing from a local checkout? Use a `link:` spec instead of step 1 —
-source edits stay live for the client half:
+Then restart `dsh --profile web` once. There is no second step: this package is
+a **bundle** (it declares `dsh.bundle.patch` next to `dsh.client`), so the dsh
+CLI's reconcile step appends it to the profile's `dsh.profile.bundles`
+automatically, and its own `cordis.patch.yml` becomes a patch layer that
+carries the plugin row. **Do not hand-edit the profile's
+`cordis.patch.yml`** — the package already ships that row.
+
+Self-check:
+
+```bash
+# the composed tree shows the package's own layer and exactly one row
+dsh --profile web --dump-config | grep -A 1 '== dsh-better-workspaces'
+#   # == dsh-better-workspaces
+#   - id: better-workspaces
+#     name: dsh-better-workspaces
+
+curl -s http://127.0.0.1:3080/better-workspaces/api/worktree-workspaces
+#   expected {"ok":true,...}; 404 means the row did not activate
+```
+
+Uninstall is symmetric — reconcile also drops the bundle from
+`dsh.profile.bundles`:
+
+```bash
+dsh plugin --profile web remove dsh-better-workspaces
+```
+
+### Upgrading from a pre-bundle install (0.0.1)
+
+Versions before 0.1.0 declared only `dsh.client`, so mounting meant
+hand-writing this row into the profile's `cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: better-workspaces
+      name: dsh-better-workspaces
+```
+
+That row must now be **deleted** (re-run the `add` command above first so
+reconcile lists the bundle). Two sources for one row is not a harmless
+duplicate: the include inserts rows verbatim and the Loader rejects a repeated
+entry id, so the next boot fails loudly with
+
+```
+duplicate loader entry id: better-workspaces
+```
+
+Delete the hand-written insert block (leave every other entry in that file,
+such as the `authorization` row, untouched) and the package's own layer takes
+over.
+
+### Developing from a local checkout
+
+Use a `link:` spec; only the spec differs, the mount is the same:
 
 ```bash
 dsh plugin --profile web add link:/path/to/dsh-better-workspaces
 ```
 
-Host code edits need a `dsh` restart (Node's ESM cache survives patch
-reloads — ADR 0003); client-bundle edits hot-rebuild in the module graph and
-only need a page refresh. The row declares `inject: ['webServer']`, so cold
-boot waits for the web server instead of racing it (ADR 0005) — if the UI is
-missing after a restart, run the self-check in the ops section below.
-Requires `git` ≥ 2.31; `gh` (authenticated) enables PR/checks features and
-degrades gracefully when absent.
+Host code edits need a `dsh` restart (Node's ESM cache survives patch reloads —
+ADR 0003); client-bundle edits hot-rebuild in the module graph and only need a
+page refresh. The package's `cordis.patch.yml` is composed at boot, so editing
+*that* file needs a restart too. The row declares `inject: ['webServer']`, so
+cold boot waits for the web server instead of racing it (ADR 0005) — if the UI
+is missing after a restart, run the self-check in the ops section below.
 
 ## Test
 
@@ -148,14 +191,25 @@ hero/徽章/tab 整体消失；而 `patchReload: live` 的热插入发生在 web
 已就绪的运行中进程里，所以一直正常。修复：`export const inject = ['webServer']`，
 Cordis 会等服务出现后再激活该行。
 
+**行从哪来**：本包声明 `dsh.bundle.patch`，所以那一行由**包自带的
+`cordis.patch.yml` 层**提供（`dsh plugin add` 负责把包写进
+`dsh.profile.bundles`）。profile 自己的 patch 层里**不该**再有同一个 id 的行：
+include 的 `insert` 是原样追加、不按 id 去重，loader 见到重复 id 直接抛
+`duplicate loader entry id: better-workspaces`，fail-loud 让整个 web 起不来。
+
 重启后自检三步：
 
-1. `dsh --profile web --dump-config | grep better-workspaces` —— 行在组合树里；
+1. `dsh --profile web --dump-config | grep -A 1 '== dsh-better-workspaces'` ——
+   出现包自带层且 `id: better-workspaces` **恰好一行**（多行 = profile 层里还留着
+   手写行，删掉它）；
 2. `curl -s http://127.0.0.1:3080/better-workspaces/api/worktree-workspaces` ——
    期望 `{"ok":true,...}`（404 = 行未激活：确认 profile `node_modules` 的
    link 依赖存在，且 `lib/index.js` 的 inject 仍含 `webServer`）；
 3. 刷新 GUI：非 worktree 工作区出现「本地」hero 控制，worktree 工作区隐藏且行图标为分支。
 
-`npm test` 含 `test/mount-check.mjs`：断言 `inject` 含 `webServer`（防回归），
-并以最小假 ctx 跑遍宿主模块 import 与 apply（dormant + webServer 两条路径），
-用于在不动 dsh 进程的前提下暴露挂载期抛错。
+`npm test` 含 `test/mount-check.mjs`：断言 `inject` 含 `webServer`（防回归）、
+断言包声明 `dsh.bundle.patch` 且自带的 patch 恰好贡献一行（`name` = 包名、
+`id` = 宿主半导出的 `name`，并随 `files` 发布）——没有这些声明，
+`dsh plugin add` 只会把包装成普通依赖、静默不挂载；同时以最小假 ctx 跑遍宿主
+模块 import 与 apply（dormant + webServer 两条路径），用于在不动 dsh 进程的
+前提下暴露挂载期抛错。

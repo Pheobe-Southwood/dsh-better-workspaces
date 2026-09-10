@@ -7,6 +7,7 @@
  * the exact cold-boot failure mode is visible without restarting dsh.
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 const MODULES = [
   '../lib/git.js',
@@ -84,6 +85,49 @@ assert.deepEqual(
   [...(plugin.inject ?? [])],
   ['webServer'],
   'host plugin must inject webServer so cordis waits for it on cold boot',
+);
+
+/* ---------------- bundle wiring: `dsh plugin add` is the whole install --------
+ * The package must declare `dsh.bundle.patch`, or the dsh CLI installs it as a
+ * plain profile dependency, prints a warning, and never lists it in
+ * `dsh.profile.bundles` — the row never reaches the composition, so every GUI
+ * surface silently disappears (the ADR 0005 failure mode, one layer earlier).
+ * The row the patch contributes must name this package (module resolution
+ * anchors on it) and carry the id the host half exports (one plugin, one row).
+ */
+const packageRoot = new URL('..', import.meta.url);
+const manifest = JSON.parse(readFileSync(new URL('package.json', packageRoot), 'utf8'));
+
+const declaredPatch = manifest.dsh?.bundle?.patch;
+assert.ok(
+  declaredPatch,
+  'package.json must declare dsh.bundle.patch or `dsh plugin --profile <p> add` only installs a plain dependency (no row, no mount)',
+);
+assert.ok(
+  manifest.files?.includes(declaredPatch.replace(/^\.\//, '')),
+  `package.json files must ship ${declaredPatch}: an npm publish would otherwise drop the only mount row`,
+);
+
+const patchSource = readFileSync(new URL(declaredPatch, packageRoot), 'utf8');
+assert.match(patchSource, /^\s*-\s*insert:/m, `${declaredPatch} must contribute a top-level insert list`);
+
+/* Exactly one row, and it must not be a second copy of a row a profile layer
+ * already carries: the include inserts verbatim and the Loader throws on a
+ * repeated entry id, so "bundle layer + hand-written row" is a boot failure
+ * rather than a harmless duplicate. */
+const rows = [...patchSource.matchAll(/^\s*-\s*id:\s*(\S+)\s*\n\s*name:\s*(\S+)\s*$/gm)].map((match) => ({
+  id: match[1],
+  name: match[2],
+}));
+assert.equal(rows.length, 1, `${declaredPatch} must contribute exactly one row, found ${rows.length}`);
+assert.equal(rows[0].name, manifest.name, 'the row must mount this package by name');
+assert.equal(rows[0].id, plugin.name, 'the row id must match the name the host half exports');
+
+const readme = readFileSync(new URL('README.md', packageRoot), 'utf8');
+assert.match(
+  readme,
+  /duplicate loader entry id/,
+  'README must document the pre-bundle upgrade cleanup and its duplicate-id symptom',
 );
 
 for (const withWebServer of [false, true]) {
