@@ -1,6 +1,6 @@
 {
   "name": "dsh-better-workspaces",
-  "description": "Git workspace enhancements for the DeepSeek Harness Web GUI: worktree staging in the hero row, per-session git badges in the sidebar, files & diff conversation views, paseo-style pull/push/PR actions",
+  "description": "Git workspace enhancements for the DeepSeek Harness Web GUI: worktree staging in the hero row, per-session git badges in the sidebar, a diff page in the official right sidebar, paseo-style pull/push/PR actions",
   "version": "0.0.1",
   "type": "module",
   "main": "lib/index.js",
@@ -20,6 +20,7 @@
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-session",
         "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
         "@deepseek-ai/dsh-client-ui-workspace"
       ],
       "platform": "web"

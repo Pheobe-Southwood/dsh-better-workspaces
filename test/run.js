@@ -506,10 +506,6 @@ await test('api routes over real HTTP', async () => {
     const acted = await post('/action', { cwd: wt1.path, name: 'commit', params: { message: 'http commit' } });
     assert.equal(acted.ok, true, JSON.stringify(acted));
 
-    const tree = await get(`/tree?cwd=${encodeURIComponent(wt1.path)}`);
-    assert.ok(tree.entries.some((e) => e.name === 'a.txt'));
-    assert.ok(!tree.entries.some((e) => e.name === '.git'));
-
     const file = await get(`/file?cwd=${encodeURIComponent(wt1.path)}&path=a.txt`);
     assert.equal(file.kind, 'text');
     assert.match(file.content, /gamma/);

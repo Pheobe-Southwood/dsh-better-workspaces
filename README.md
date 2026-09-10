@@ -36,9 +36,16 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 2. **Sidebar git badges** — session rows stretch vertically; below the title:
    `branch · #PR (green open / purple merged / red closed) · checks pie ring ·
    +N/−N · ↑a↓b (only when non-zero)`. Missing items are omitted.
-3. **Diff pill + tabs** — a `± +N/−N` pill above the composer (click → jumps
-   to the diff tab) and two new conversation tabs: `文件` (order 20) and
-   `diff` (order 30) beside 对话/轨迹.
+3. **Diff pill + right-sidebar page** — a `±` pill above the composer opens the
+   diff view as a page tab in dsh's official right Sidebar (the column expands,
+   and an already-open tab is revealed rather than duplicated). The pill stays
+   put for every git session — `+N −N` when there is a diffstat, the changed
+   file count when only the tree is dirty, `↑N 未推送` when only unpushed
+   commits exist, and the bare `diff` otherwise — because the conversation no
+   longer carries a diff tab of its own. In the sidebar the file list sits
+   above the diff pane so the 300 px panel stays readable.
+   The old `文件`/`diff` conversation tabs are gone: dsh 0.1.5 shipped the
+   right Sidebar's own `文件` panel, which supersedes the plugin's file view.
 4. **Diff view** — four modes with paseo-parity defaults: `未提交` (working
    tree incl. untracked vs HEAD), `本会话` (default in shared workspaces: the
    uncommitted diff filtered to files this session wrote, attributed from its
@@ -53,15 +60,11 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    action carries a precise localized reason. PR + checks come from one
    batched `gh` GraphQL call (30 s TTL, last-good fallback); PRs poll
    adaptively (20 s pending / 120 s idle). Each editable file head carries
-   an `编辑` button opening the shared file editor.
-5. **Files view** — lazy directory tree with material file icons by
-   extension (vendor table + Oklab desaturation ported from paseo, see
-   NOTICE) + viewer (text with line numbers, images, binary/too-large
-   notices) + `编辑` button opening the shared **file editor**: monospace
-   textarea, dirty marker, Ctrl/Cmd+S, saved through `POST /file` with
-   sha1 compare-and-swap (concurrent on-disk change → 409 conflict +
-   reload, never a silent overwrite; containment/size/binary guards,
-   atomic tmp+rename write).
+   an `编辑` button opening the shared **file editor**: monospace textarea,
+   dirty marker, Ctrl/Cmd+S, saved through `POST /file` with sha1
+   compare-and-swap (concurrent on-disk change → 409 conflict + reload,
+   never a silent overwrite; containment/size/binary guards, atomic
+   tmp+rename write).
 
 ## Architecture
 
@@ -76,9 +79,10 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
   fingerprint-deduped SSE; HTTP+SSE API on the harness webServer under
   `/better-workspaces/api`.
 - **Client** (`lib/client.js`, hand-written `__ModuleLoader__` bundle):
-  slot-registered tabs/dock pill; DOM injection (MutationObserver + React
-  portals + anchor self-check with silent degradation, ADR 0001) for the hero
-  dropdown and sidebar badges, which have no fine-grained slots.
+  slot-registered right-Sidebar diff page + dock pill; DOM injection
+  (MutationObserver + React portals + anchor self-check with silent
+  degradation, ADR 0001) for the hero dropdown and sidebar badges, which have
+  no fine-grained slots.
 
 See `CONTEXT.md` for the glossary and `docs/adr/` for the design records.
 

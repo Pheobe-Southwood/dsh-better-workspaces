@@ -63,14 +63,37 @@ assert.deepEqual(mod.inject, ['slots', 'locale', 'sessions', 'workspaces']);
 let dictionaries = null;
 const registrations = [];
 const effects = [];
+/* The official right Sidebar is present in this install: the plugin's diff page
+   type registers through the service-gated child fiber real cordis starts. */
+const tabTypes = [];
+const sidebarRightTabs = {
+  register(definition) {
+    tabTypes.push(definition);
+    return () => {};
+  },
+};
+const sidebarRight = { openTab() {} };
+
 const ctx = {
+  // a hard inject would make `sidebarRightTabs` a ctx property inside the fiber
+  sidebarRightTabs,
   effect(fn, label) {
     const dispose = fn(ctx);
     effects.push({ label, dispose });
     return dispose;
   },
-  get() {
+  get(name) {
+    if (name === 'sidebarRightTabs') return sidebarRightTabs;
+    if (name === 'sidebarRight') return sidebarRight;
     return undefined;
+  },
+  inject(deps, callback) {
+    assert.ok(
+      deps.includes('sidebarRightTabs'),
+      'the diff page waits for the right Sidebar tab registry instead of injecting it',
+    );
+    callback(ctx);
+    return { dispose() {} };
   },
   locale: {
     register(ns, dicts) {
@@ -116,35 +139,50 @@ assert.equal(dictionaries.ns, 'better-workspaces');
 const zhKeys = Object.keys(dictionaries.dicts.zh).sort();
 const enKeys = Object.keys(dictionaries.dicts.en).sort();
 assert.deepEqual(enKeys, zhKeys, 'zh/en key parity');
-assert.equal(dictionaries.dicts.zh['view.files'], '文件');
 assert.equal(dictionaries.dicts.zh['view.diff'], 'diff');
+assert.equal(dictionaries.dicts.zh['view.files'], undefined, 'the 文件 conversation view is gone');
 
 const descriptors = registrations.filter((r) => r.descriptor).map((r) => r.descriptor);
 const views = descriptors.filter((d) => d.name === 'conversation.view');
 const docks = descriptors.filter((d) => d.name === 'conversation.input.dock');
-assert.equal(views.length, 2, 'two conversation views');
-assert.deepEqual(
-  views.map((v) => [v.id, v.order]).sort(),
-  [['diff', 30], ['files', 20]].sort(),
-);
+assert.equal(views.length, 0, 'the plugin no longer contributes conversation views');
 assert.equal(docks.length, 1, 'one dock occupant');
 assert.equal(docks[0].id, 'git-diff-pill');
 assert.equal(docks[0].order, 100);
 for (const r of registrations.filter((x) => x.component)) {
   assert.equal(typeof r.component, 'function', 'component is a function');
 }
-// every descriptor carries an inject(sessionId) that yields {sessionId}
-for (const d of descriptors) {
+// every remaining descriptor carries an inject(sessionId) that yields {sessionId}
+for (const d of docks) {
   assert.equal(typeof d.inject, 'function');
   assert.deepEqual(d.inject('s-1'), { sessionId: 's-1' });
   assert.equal(d.locale, 'better-workspaces');
 }
 
-// label thunks resolve through the bound locale
-const filesView = views.find((v) => v.id === 'files');
-const diffView = views.find((v) => v.id === 'diff');
-assert.equal(filesView.label(), '文件');
-assert.equal(diffView.label(), 'diff');
+/* ---------------- diff as an official right-Sidebar page type ---------------- */
+assert.equal(tabTypes.length, 1, 'exactly one right-Sidebar tab type');
+const diffType = tabTypes[0];
+assert.equal(diffType.id, 'dsh-better-workspaces/diff');
+assert.equal(diffType.kind, 'bw-diff');
+assert.equal(diffType.priority, 'extension');
+assert.equal(diffType.title('sidebar://bw-diff'), 'diff');
+assert.equal(
+  diffType.guide,
+  undefined,
+  'no guide entry: a second guide entry would flip the sidebar default seed away from 文件',
+);
+
+const sidebarSlots = registrations.filter(
+  (r) => r.descriptor && String(r.descriptor.name).startsWith('sidebar.right.pane.tab'),
+);
+assert.deepEqual(
+  sidebarSlots.map((r) => [r.descriptor.name, r.descriptor.key]).sort(),
+  [
+    ['sidebar.right.pane.tab', 'dsh-better-workspaces/diff'],
+    ['sidebar.right.pane.tab.title', 'dsh-better-workspaces/diff'],
+  ].sort(),
+  'body and chip title register under the definition id',
+);
 
 /* ---------------- first-send interception helpers (pure) ---------------- */
 const T = mod.__bwTest;
@@ -158,13 +196,35 @@ assert.equal(T.basenameOf('/a/b/repo/'), 'repo');
 assert.equal(T.basenameOf('/a/b/repo'), 'repo');
 assert.match(T.mnemonicSlug(), /^[a-z]+-[a-z]+-[0-9a-f]{4}$/);
 
-// file icon resolver (vendored table + Oklab tone)
-const tsIcon = T.getFileIconSvg('app.ts');
-assert.ok(tsIcon.includes('<svg'), 'ts icon renders svg');
-assert.notEqual(tsIcon, T.getFileIconSvg('no-such-file.xyz'), 'extension maps to its own icon');
-assert.equal(T.getFileIconSvg('README'), T.getFileIconSvg('no-such-file.xyz'), 'unknown falls back to default');
-assert.match(T.desaturateHexColor('#ff0000', 0.65), /^#[0-9a-f]{6}$/);
-assert.notEqual(T.desaturateHexColor('#ff0000', 0.65), '#ff0000');
+// the retired file view left no icon plumbing behind
+assert.equal(T.getFileIconSvg, undefined, 'vendored material icon table removed');
+assert.equal(T.desaturateHexColor, undefined, 'Oklab helpers removed with it');
+// the page's identity is exported so the definition and the slot keys can be cross-checked
+assert.equal(T.SIDEBAR_DIFF_ID, diffType.id);
+assert.equal(T.SIDEBAR_DIFF_KIND, diffType.kind);
+
+// the pill is the diff page's only door: it must stay put for every git state
+const tr = dictionaries.dicts.zh;
+const label = (snapshot) => T.pillLabel(snapshot, (key, params) =>
+  (tr[key] ?? key).replace(/\{(\w+)\}/g, (m, name) => (params && name in params ? String(params[name]) : m)));
+const statLabel = label({ diffStat: { additions: 3, deletions: 1 }, dirty: true });
+assert.equal(statLabel.children[0].props.className, 'dsh-bw-green');
+assert.equal(statLabel.children[1], ' ');
+assert.equal(statLabel.children[2].props.className, 'dsh-bw-red');
+assert.equal(
+  label({ diffStat: { additions: 0, deletions: 0 }, dirty: true, changedFileCount: 4 }).children[0],
+  '4 个文件有改动',
+);
+assert.equal(
+  label({ diffStat: { additions: 0, deletions: 0 }, dirty: false, upstream: { ahead: 2 } }).children[0],
+  '↑2 未推送',
+  'a clean tree with unpushed commits still reports them',
+);
+assert.equal(
+  label({ diffStat: { additions: 0, deletions: 0 }, dirty: false, upstream: { ahead: 0 } }).children[0],
+  'diff',
+  'a clean, pushed tree keeps the pill with the bare page name',
+);
 
 // new picker/editor dict keys
 assert.equal(dictionaries.dicts.zh['hero.localSuffix'], '（本地）');
@@ -173,6 +233,9 @@ assert.equal(dictionaries.dicts.en['files.conflict'], 'File changed on disk sinc
 assert.equal(dictionaries.dicts.zh['diff.editFile'], '编辑');
 assert.equal(dictionaries.dicts.zh['diff.modeSession'], '本会话');
 assert.equal(dictionaries.dicts.en['diff.modeTask'], 'Task');
+assert.equal(dictionaries.dicts.zh['files.pickHint'], undefined, 'file-tree copy removed');
+assert.equal(dictionaries.dicts.zh['files.edit'], undefined, 'file-tree copy removed');
+assert.equal(dictionaries.dicts.zh['files.save'], '保存', 'the shared editor copy stays');
 
 // per-session touched-path extraction helpers
 const found = new Set();
