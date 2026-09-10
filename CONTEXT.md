@@ -1,6 +1,6 @@
 # dsh-better-workspaces 上下文
 
-DSH Web GUI 的 git 增强插件：为新会话做 worktree 预备、在侧栏呈现每个会话的 git 徽章、并提供「文件」「diff」两个会话视图。本文件是项目领域语言的术语表。
+DSH Web GUI 的 git 增强插件：为新会话做 worktree 预备、在侧栏呈现每个会话的 git 徽章、并在官方右侧栏提供一个 diff 页签。本文件是项目领域语言的术语表。
 
 ## 会话与工作区
 
@@ -96,14 +96,15 @@ open（绿）/ merged（紫）/ closed（红）三态；序号自 PR URL 解析�
 _Avoid_: 状态栏、标签行
 
 **diff pill**：
-输入框上方的 DiffStat 胶囊；点击跳转 diff 视图；无任何变更时隐藏。
+输入框上方的 DiffStat 胶囊；点击在官方右侧栏打开（或展开并定位到）diff 页签；无任何变更时仍显示，标签退化为「diff」。
+_Avoid_: diff 按钮
 
-**文件视图（「文件」tab）**：
-以会话 cwd 为根的文件树与文件查看器；文件名左侧按扩展名显示 material 风格图标（经 Oklab 降饱和），文本文件可进入编辑器修改。
-_Avoid_: 只读浏览器
+**diff 页签**：
+官方右侧栏里的一个 page 类型（kind `bw-diff`）；本插件不注册 guide 条目，故右侧栏首次打开的默认页仍是官方「文件」，进入 diff 只走 diff pill（理由见 ADR 0006）。
+_Avoid_: diff tab（那是已删除的会话视图）
 
 **文件编辑器**：
-文件/diff 两视图共用的文本编辑面板：等宽 textarea、脏标记、Ctrl/Cmd+S；保存走 POST /file 的 sha1 CAS——磁盘内容自加载后被改动则 409 冲突，提示重新加载，绝不静默覆盖。
+diff 视图内的文本编辑面板：等宽 textarea、脏标记、Ctrl/Cmd+S；保存走 POST /file 的 sha1 CAS——磁盘内容自加载后被改动则 409 冲突，提示重新加载，绝不静默覆盖。会话「文件」视图随官方右侧栏「文件」面板下线后，本编辑器只服务 diff 视图。
 _Avoid_: 在线 IDE
 
 **任务 diff（task diff）**：
@@ -122,8 +123,8 @@ _Avoid_: 本地默认基
 worktree 工作区标题的出处标记：创建时取发起会话所属工作区的标题（存入元数据 sourceWorkspaceTitle），标题形如「<源工作区> · <分支>」，会话获名后跟随为「<源工作区> · <会话标题>」。标题只写给「当前会话 cwd 所属的那个工作区」，且所用 git 检测结果必须与 cwd 绑定（检测值带 cwd 标签，跨 cwd 一律视为无效）——否则会话切换时会把前缀写到别的工作区上。
 _Avoid_: 仓库名前缀
 
-**diff 视图（「diff」tab）**：
-承载未提交/已提交两模式 diff、commit 列表与操作面板的会话视图。
+**diff 视图**：
+官方右侧栏 diff 页签承载的内容：未提交/已提交两模式 diff、commit 列表与操作面板；窄面板下文件列表在 diff 之上纵向排布。
 
 **操作阶梯**：
 diff 视图主操作按状态晋升的顺序：Commit（脏时）→ Pull（落后上游时）→ Push（未推送时）→ Merge PR → auto-merge → Create PR → Merge-to-base → Update-from-base → Archive；未晋升者入溢出菜单，禁用项必须携带精确原因文案。
