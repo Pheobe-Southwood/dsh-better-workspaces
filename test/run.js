@@ -21,6 +21,7 @@ const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.j
 const { commitAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
+const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable } = await import('../lib/forge.js');
 
 function git(cwd, ...args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' });
@@ -448,6 +449,307 @@ await test('archive guards + archive', async () => {
   assert.equal(notManaged.reason, 'not-managed');
 });
 
+/* ---------------- PR checkout (the forge's refs/pull/<N>/head) ---------------- */
+
+/** git that answers null instead of throwing — for expected-failure probes. */
+function tryGit(cwd, ...args) {
+  try {
+    return git(cwd, ...args);
+  } catch {
+    return null;
+  }
+}
+
+/** git that MUST fail: returns git's stderr (captured, so the log stays clean). */
+function gitFailure(cwd, ...args) {
+  try {
+    execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    return String(error.stderr || error.message);
+  }
+  throw new Error(`expected git ${args.join(' ')} to fail`);
+}
+
+function cloneRepo(from, to) {
+  return execFileSync('git', ['clone', '--quiet', from, to], {
+    cwd: scratch,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+const prRemote = join(scratch, 'pr-remote.git');
+const prRepo = join(scratch, 'pr-clone');
+const prForkRemote = join(scratch, 'pr-fork-remote.git');
+const prForkRepo = join(scratch, 'pr-fork-clone');
+mkdirSync(prRemote);
+git(prRemote, 'init', '--bare', '-b', 'main');
+cloneRepo(prRemote, prRepo);
+git(prRepo, 'config', 'user.email', 'test@dsh.local');
+git(prRepo, 'config', 'user.name', 'DSH Test');
+writeFileSync(join(prRepo, 'base.txt'), 'base\n');
+git(prRepo, 'add', '-A');
+git(prRepo, 'commit', '-m', 'base commit');
+git(prRepo, 'push', '--quiet', 'origin', 'main');
+
+/**
+ * One PR head that exists ONLY as refs/pull/<N>/head on the bare remote — the
+ * real forge layout: the contributor's branch is deleted again, so nothing
+ * else (no local branch, no origin branch) can supply the commit.
+ */
+function pushPrHead(number, branch, file, content) {
+  git(prRepo, 'checkout', '--quiet', '-b', branch);
+  writeFileSync(join(prRepo, file), content);
+  git(prRepo, 'add', '-A');
+  git(prRepo, 'commit', '-m', `${branch} commit`);
+  const sha = git(prRepo, 'rev-parse', 'HEAD').trim();
+  git(prRepo, 'push', '--quiet', 'origin', `HEAD:refs/pull/${number}/head`);
+  git(prRepo, 'checkout', '--quiet', 'main');
+  git(prRepo, 'branch', '-D', branch);
+  assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`), null, 'head branch deleted again');
+  return sha;
+}
+
+const prSameRepoHead = pushPrHead(12, 'pr-same-repo', 'pr.txt', 'from the pr\n');
+const prForkHead = pushPrHead(9, 'dark-mode', 'dark.txt', 'dark mode\n');
+const prPostHead = pushPrHead(21, 'pr-post', 'post.txt', 'from the http route\n');
+const prLockedHead = pushPrHead(33, 'pr-locked', 'locked.txt', 'locked\n');
+
+// a contributor's fork clone: origin is the fork (no refs/pull/*), the base
+// repository — the one that does carry them — is `upstream`
+mkdirSync(prForkRemote);
+git(prForkRemote, 'init', '--bare', '-b', 'main');
+git(prRepo, 'push', '--quiet', prForkRemote, 'main:main');
+cloneRepo(prForkRemote, prForkRepo);
+git(prForkRepo, 'remote', 'add', 'upstream', prRemote);
+
+// local main diverges from origin/main so origin-first base resolution is observable
+writeFileSync(join(prRepo, 'local-only.txt'), 'never pushed\n');
+git(prRepo, 'add', '-A');
+git(prRepo, 'commit', '-m', 'local main commit (never pushed)');
+const prOriginMain = git(prRepo, 'rev-parse', 'refs/remotes/origin/main').trim();
+assert.notEqual(git(prRepo, 'rev-parse', 'refs/heads/main').trim(), prOriginMain);
+
+await test('pr-checkout: same-repo PR head via refs/pull/<N>/head + tracking ref', async () => {
+  // only the forge ref carries this commit: no local branch, no origin branch
+  assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/pr-same-repo'), null);
+  assert.equal(tryGit(prRepo, 'merge-base', '--is-ancestor', prSameRepoHead, 'main'), null, 'PR head is not on main');
+
+  const wt = await createWorktree({
+    repoRoot: prRepo,
+    intent: 'pr-checkout',
+    pull: { number: 12, headRef: 'pr-same-repo', baseRef: 'main' },
+    sourceTitle: 'PR 12',
+  });
+  try {
+    assert.equal(wt.branch, 'pr-same-repo');
+    assert.equal(wt.copiedFrom, null);
+    assert.equal(wt.pullNumber, 12);
+    assert.equal(wt.prHeadSha, prSameRepoHead);
+    assert.equal(wt.upstream, 'origin/pr-same-repo');
+    assert.equal(wt.baseRefName, 'main');
+    assert.equal(wt.baseRef, prOriginMain, 'the base is origin/main, not the newer local main');
+    // the worktree really holds the PR head, not the base
+    assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead);
+    assert.equal(readFileSync(join(wt.path, 'pr.txt'), 'utf8'), 'from the pr\n');
+    // the universal ref landed in the throwaway ref…
+    assert.equal(git(prRepo, 'rev-parse', 'refs/dsh-better-workspaces/pr/12/pr-same-repo').trim(), prSameRepoHead);
+    // …and origin/<headRef> was materialized from that very SHA, so the
+    // tracking ref resolves even though the branch was never pushed
+    const seeded = tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/pr-same-repo');
+    assert.equal((seeded || '').trim(), prSameRepoHead, 'origin/<headRef> materialized from the fetched SHA');
+    assert.equal(git(wt.path, 'rev-parse', '--abbrev-ref', '@{upstream}').trim(), 'origin/pr-same-repo');
+
+    const meta = await readMetadata(wt.path);
+    assert.equal(meta.intent, 'pr-checkout');
+    assert.equal(meta.branch, 'pr-same-repo');
+    assert.equal(meta.pullNumber, 12);
+    assert.equal(meta.pullHeadRef, 'pr-same-repo');
+    assert.equal(meta.prHeadSha, prSameRepoHead);
+    assert.equal(meta.upstream, 'origin/pr-same-repo');
+    assert.equal(meta.baseRefName, 'main');
+    assert.equal(meta.baseRef, prOriginMain);
+    assert.equal(meta.sourceWorkspaceTitle, 'PR 12');
+    assert.equal('pullForkOwner' in meta, false);
+    assert.equal('autoName' in meta, false, 'a PR checkout is never an auto-rename candidate');
+  } finally {
+    await archiveWorktree(wt.path, { force: true });
+  }
+});
+
+await test('pr-checkout: a taken local branch name uniquifies (-1, -2)', async () => {
+  // the first checkout left refs/heads/pr-same-repo behind (archive keeps branches)
+  assert.ok(git(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/heads/pr-same-repo').trim());
+  const pull = { number: 12, headRef: 'pr-same-repo', baseRef: 'main' };
+  const wt = await createWorktree({ repoRoot: prRepo, intent: 'pr-checkout', pull });
+  const wt2 = await createWorktree({ repoRoot: prRepo, intent: 'pr-checkout', pull });
+  try {
+    assert.equal(wt.branch, 'pr-same-repo-1');
+    assert.equal(wt2.branch, 'pr-same-repo-2');
+    for (const created of [wt, wt2]) {
+      assert.equal(created.prHeadSha, prSameRepoHead);
+      assert.equal(git(created.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead);
+      assert.equal((await readMetadata(created.path)).pullHeadRef, 'pr-same-repo');
+    }
+  } finally {
+    for (const created of [wt, wt2]) await archiveWorktree(created.path, { force: true });
+  }
+});
+
+await test('pr-checkout: fork PR → owner-prefixed branch, no upstream', async () => {
+  const wt = await createWorktree({
+    repoRoot: prRepo,
+    intent: 'pr-checkout',
+    pull: { number: 9, headRef: 'dark-mode', baseRef: 'main', forkOwner: 'alice' },
+  });
+  try {
+    assert.equal(wt.branch, 'alice/dark-mode');
+    assert.equal(wt.prHeadSha, prForkHead);
+    assert.equal(wt.upstream, null);
+    assert.equal(wt.baseRefName, 'main');
+    assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prForkHead);
+    assert.match(gitFailure(wt.path, 'rev-parse', '@{upstream}'), /no upstream configured/, 'a fork head must not track origin/dark-mode');
+    const meta = await readMetadata(wt.path);
+    assert.equal(meta.pullNumber, 9);
+    assert.equal(meta.pullHeadRef, 'dark-mode');
+    assert.equal(meta.pullForkOwner, 'alice');
+    assert.equal('upstream' in meta, false);
+    assert.equal('autoName' in meta, false);
+    // the head landed in the PR's own throwaway ref (named after the anchor)
+    assert.equal(git(prRepo, 'rev-parse', 'refs/dsh-better-workspaces/pr/9/alice/dark-mode').trim(), prForkHead);
+    // and nothing was synthesized as the BASE repo's origin/dark-mode
+    assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/dark-mode'), null);
+  } finally {
+    await archiveWorktree(wt.path, { force: true });
+  }
+});
+
+await test('pr-checkout: origin is tried first, upstream is the fallback', async () => {
+  // this clone's origin is the fork: it has no refs/pull/*, only upstream does
+  assert.equal(tryGit(prForkRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/pr-same-repo'), null);
+  const wt = await createWorktree({
+    repoRoot: prForkRepo,
+    intent: 'pr-checkout',
+    pull: { number: 12, headRef: 'pr-same-repo', baseRef: 'main' },
+  });
+  try {
+    assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead, 'the head came from upstream');
+    assert.equal(wt.prHeadSha, prSameRepoHead);
+    assert.equal(wt.upstream, null, 'a head fetched from upstream never tracks origin');
+    assert.equal(wt.baseRefName, 'main');
+    assert.match(gitFailure(wt.path, 'rev-parse', '@{upstream}'), /no upstream configured/);
+    const meta = await readMetadata(wt.path);
+    assert.equal(meta.pullNumber, 12);
+    assert.equal(meta.pullHeadRef, 'pr-same-repo');
+    assert.equal('upstream' in meta, false);
+    assert.equal(tryGit(prForkRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/pr-same-repo'), null);
+  } finally {
+    await archiveWorktree(wt.path, { force: true });
+  }
+});
+
+await test('pr-checkout: an unseedable tracking ref must not fake an upstream', async () => {
+  // hold the loose-ref lock so `git update-ref refs/remotes/origin/<headRef>`
+  // fails deterministically: the checkout must still succeed, but it must
+  // report NO upstream instead of one that `@{upstream}` cannot resolve
+  const lock = join(prRepo, '.git', 'refs', 'remotes', 'origin', 'pr-locked.lock');
+  mkdirSync(join(prRepo, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
+  writeFileSync(lock, '');
+  let wt;
+  try {
+    wt = await createWorktree({
+      repoRoot: prRepo,
+      intent: 'pr-checkout',
+      pull: { number: 33, headRef: 'pr-locked', baseRef: 'main' },
+    });
+  } finally {
+    rmSync(lock, { force: true });
+  }
+  try {
+    assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prLockedHead, 'creation is not blocked by the tracking failure');
+    assert.equal(wt.prHeadSha, prLockedHead);
+    assert.equal(wt.upstream, null);
+    const meta = await readMetadata(wt.path);
+    assert.equal(meta.pullNumber, 33);
+    assert.equal('upstream' in meta, false);
+    assert.match(gitFailure(wt.path, 'rev-parse', '@{upstream}'), /no upstream configured/);
+  } finally {
+    await archiveWorktree(wt.path, { force: true });
+  }
+});
+
+await test('pr-checkout: guards + tolerant base', async () => {
+  // a number the forge does not have: the message names every attempted remote
+  // ref AND the reason git gave, not a generic "did not resolve"
+  await assert.rejects(
+    createWorktree({ repoRoot: prForkRepo, intent: 'pr-checkout', pull: { number: 999, headRef: 'nope', baseRef: 'main' } }),
+    (error) => {
+      assert.match(error.message, /#999/);
+      assert.match(error.message, /origin refs\/pull\/999\/head/);
+      assert.match(error.message, /upstream refs\/pull\/999\/head/);
+      assert.match(error.message, /couldn't find remote ref refs\/pull\/999\/head/);
+      return true;
+    },
+  );
+  // headRef is what names the local branch: it is mandatory
+  await assert.rejects(createWorktree({ repoRoot: prRepo, intent: 'pr-checkout', pull: { number: 12 } }), /pull\.headRef/);
+  // no remote to fetch a pull request from at all
+  await assert.rejects(
+    createWorktree({ repoRoot: repo, intent: 'pr-checkout', pull: { number: 12, headRef: 'pr-same-repo' } }),
+    /no origin\/upstream remote/,
+  );
+  // a base the forge cannot resolve still yields a worktree (tolerant resolution)
+  const wt = await createWorktree({
+    repoRoot: prRepo,
+    intent: 'pr-checkout',
+    pull: { number: 12, headRef: 'pr-same-repo', baseRef: 'no-such-base' },
+  });
+  try {
+    assert.match(wt.branch, /^pr-same-repo-\d+$/);
+    assert.equal(wt.baseRefName, 'no-such-base');
+    assert.equal(wt.baseRef, 'no-such-base');
+    assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead);
+    const meta = await readMetadata(wt.path);
+    assert.equal(meta.baseRefName, 'no-such-base');
+    assert.equal(meta.baseRef, 'no-such-base');
+  } finally {
+    await archiveWorktree(wt.path, { force: true });
+  }
+});
+
+await test('api: POST /worktrees with pull → pr-checkout', async () => {
+  const hub = createGitStateHub({ onChange: () => {} });
+  const api = createApi(hub, {});
+  const server = http.createServer((req, res) => api.route.handler(req, res));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
+  try {
+    const res = await fetch(`${base}/worktrees`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd: prRepo, pull: { number: 21, headRef: 'pr-post', baseRef: 'main' }, sourceTitle: 'PR 21' }),
+    });
+    const created = await res.json();
+    assert.equal(created.ok, true, JSON.stringify(created));
+    assert.equal(created.branch, 'pr-post');
+    assert.equal(created.pullNumber, 21);
+    assert.equal(created.prHeadSha, prPostHead);
+    assert.equal(created.upstream, 'origin/pr-post');
+    assert.equal(readFileSync(join(created.path, 'post.txt'), 'utf8'), 'from the http route\n');
+    const meta = await readMetadata(created.path);
+    assert.equal(meta.intent, 'pr-checkout');
+    assert.equal(meta.pullNumber, 21);
+    assert.equal(meta.pullHeadRef, 'pr-post');
+    assert.equal(meta.prHeadSha, prPostHead);
+    assert.equal(meta.sourceWorkspaceTitle, 'PR 21');
+    await archiveWorktree(created.path, { force: true });
+  } finally {
+    api.dispose();
+    server.close();
+    await hub.dispose();
+  }
+});
+
 /* ---------------- HTTP layer ---------------- */
 await test('api routes over real HTTP', async () => {
   const hub = createGitStateHub({ onChange: () => {} });
@@ -561,6 +863,346 @@ await test('api routes over real HTTP', async () => {
     assert.match(text, /:connected/);
     controller.abort();
     await reader.cancel().catch(() => {});
+  } finally {
+    api.dispose();
+    server.close();
+    await hub.dispose();
+  }
+});
+
+/* ---------------- forge: the gh CLI, /pulls + /pull ---------------- */
+
+// `lib/forge.js` shells out to the real `gh`, so the CLI itself is the fixture:
+// a fake executable EARLY in PATH whose JSON mirrors `gh --json` exactly
+// (label objects included, so the flattening is provable). Every call is
+// logged as "<cwd>\t<args>" so the tests can show what the host layer passed.
+const fakeGHDir = join(scratch, 'fake-gh');
+const fakeGHLog = join(fakeGHDir, 'gh.log');
+const fakeGH = String.raw`#!/bin/sh
+printf '%s\t%s\n' "$(pwd)" "$*" >> "$FAKE_GH_DIR/gh.log"
+
+case "$1" in
+  --version)
+    echo "gh version 9.9.9-fake (dsh test)"
+    exit 0
+    ;;
+esac
+
+# the unauthenticated fixture: gh exists, but every command (auth status
+# included) fails the way an expired login does
+if [ "$FAKE_GH_UNAUTH" = "1" ]; then
+  echo "gh: To get started with GitHub CLI, please run: gh auth login" >&2
+  exit 1
+fi
+
+case "$1 $2" in
+  "auth status")
+    echo "github.com"
+    echo "  Logged in to github.com account dsh-tester (oauth_token)"
+    exit 0
+    ;;
+  "pr list")
+    cat <<'JSON'
+[
+  {
+    "number": 12,
+    "title": "Fix the flaky login test",
+    "url": "https://github.com/acme/widget/pull/12",
+    "state": "OPEN",
+    "body": "Closes #31",
+    "labels": [{"name": "bug"}, {"name": "ready"}],
+    "baseRefName": "main",
+    "headRefName": "fix-login",
+    "headRepositoryOwner": {"login": "acme"},
+    "isCrossRepository": false,
+    "updatedAt": "2024-05-02T10:00:00Z"
+  },
+  {
+    "number": 9,
+    "title": "Add dark mode",
+    "url": "https://github.com/acme/widget/pull/9",
+    "state": "MERGED",
+    "body": "opened from a fork",
+    "labels": [{"name": "ui"}],
+    "baseRefName": "main",
+    "headRefName": "dark-mode",
+    "headRepositoryOwner": {"login": "alice-dev"},
+    "isCrossRepository": true,
+    "updatedAt": "2024-05-01T09:00:00Z"
+  },
+  {
+    "number": 5,
+    "title": "Refactor the parser",
+    "url": "https://github.com/acme/widget/pull/5",
+    "state": "CLOSED",
+    "body": null,
+    "labels": ["legacy-string"],
+    "baseRefName": "develop",
+    "headRefName": "parser",
+    "headRepositoryOwner": {"login": "acme"},
+    "isCrossRepository": false,
+    "updatedAt": "2024-04-20T08:00:00Z"
+  }
+]
+JSON
+    exit 0
+    ;;
+  "issue list")
+    cat <<'JSON'
+[
+  {
+    "number": 31,
+    "title": "Login page 500s on Safari",
+    "url": "https://github.com/acme/widget/issues/31",
+    "state": "OPEN",
+    "body": "steps to reproduce",
+    "labels": [{"name": "bug"}],
+    "updatedAt": "2024-05-03T12:00:00Z"
+  },
+  {
+    "number": 21,
+    "title": "Add dark mode",
+    "url": "https://github.com/acme/widget/issues/21",
+    "state": "CLOSED",
+    "body": "wishlist",
+    "labels": [],
+    "updatedAt": "2024-04-25T07:00:00Z"
+  }
+]
+JSON
+    exit 0
+    ;;
+esac
+
+case "$1 $2 $3" in
+  "pr view 12")
+    cat <<'JSON'
+{"number":12,"title":"Fix the flaky login test","url":"https://github.com/acme/widget/pull/12","state":"OPEN","body":"Closes #31","labels":[{"name":"bug"},{"name":"ready"}],"baseRefName":"main","headRefName":"fix-login","headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"updatedAt":"2024-05-02T10:00:00Z"}
+JSON
+    exit 0
+    ;;
+  "pr view 9")
+    cat <<'JSON'
+{"number":9,"title":"Add dark mode","url":"https://github.com/acme/widget/pull/9","state":"MERGED","body":"opened from a fork","labels":[{"name":"ui"}],"baseRefName":"main","headRefName":"dark-mode","headRepositoryOwner":{"login":"alice-dev"},"isCrossRepository":true,"updatedAt":"2024-05-01T09:00:00Z"}
+JSON
+    exit 0
+    ;;
+  "issue view 31")
+    cat <<'JSON'
+{"number":31,"title":"Login page 500s on Safari","url":"https://github.com/acme/widget/issues/31","state":"OPEN","body":"steps to reproduce","labels":[{"name":"bug"}],"updatedAt":"2024-05-03T12:00:00Z"}
+JSON
+    exit 0
+    ;;
+esac
+
+# anything else: the non-zero exit a real gh uses for "nothing matched", so the
+# host layer must fall back (pr view → issue view) instead of failing
+echo "no pull requests or issues matched: $*" >&2
+exit 1
+`;
+mkdirSync(fakeGHDir, { recursive: true });
+writeFileSync(join(fakeGHDir, 'gh'), fakeGH, { mode: 0o755 });
+process.env.FAKE_GH_DIR = fakeGHDir;
+// before any real gh installation on this machine
+process.env.PATH = `${fakeGHDir}:${process.env.PATH}`;
+
+await test('forge: gh missing from PATH → cli_missing', async () => {
+  // `ghAvailable` caches "installed" for the whole process, so the missing-gh
+  // case gets its own module instance instead of poisoning the shared one
+  const isolated = await import('../lib/forge.js?gh-missing');
+  const emptyBin = join(scratch, 'empty-bin');
+  mkdirSync(emptyBin, { recursive: true });
+  const withFakeGH = process.env.PATH;
+  process.env.PATH = emptyBin;
+  try {
+    assert.equal(await isolated.ghAvailable(), false);
+    assert.deepEqual(await isolated.listForgeItems({ cwd: prRepo }), { items: [], authState: 'cli_missing' });
+    assert.deepEqual(await isolated.pullRequestDetail({ cwd: prRepo, number: 12 }), {
+      ok: false,
+      authState: 'cli_missing',
+      message: 'gh CLI not installed',
+    });
+  } finally {
+    process.env.PATH = withFakeGH;
+  }
+});
+
+await test('forge: auth states + gh JSON flattening (list + detail)', async () => {
+  assert.equal(await ghAvailable(), true, 'the process-wide probe must find the fake gh');
+
+  // gh exists but `gh auth status` fails
+  process.env.FAKE_GH_UNAUTH = '1';
+  invalidateGhAuth();
+  assert.deepEqual(await listForgeItems({ cwd: prRepo }), { items: [], authState: 'unauthenticated' });
+  assert.deepEqual(await pullRequestDetail({ cwd: prRepo, number: 12 }), {
+    ok: false,
+    authState: 'unauthenticated',
+    message: 'gh is not authenticated',
+  });
+  delete process.env.FAKE_GH_UNAUTH;
+  invalidateGhAuth();
+
+  // both subcommands answer with JSON → issues + PRs merged newest-first
+  invalidateForgeList();
+  const listed = await listForgeItems({ cwd: prRepo });
+  assert.equal(listed.authState, 'authenticated');
+  assert.deepEqual(listed.items.map((i) => i.number), [31, 12, 9, 21, 5], 'merged and sorted by updatedAt');
+  assert.deepEqual(listed.items.map((i) => i.kind), ['issue', 'change_request', 'change_request', 'issue', 'change_request']);
+  assert.deepEqual(listed.items.find((i) => i.number === 12), {
+    kind: 'change_request',
+    number: 12,
+    title: 'Fix the flaky login test',
+    url: 'https://github.com/acme/widget/pull/12',
+    state: 'open',
+    body: 'Closes #31',
+    labels: ['bug', 'ready'],
+    updatedAt: '2024-05-02T10:00:00Z',
+    baseRefName: 'main',
+    headRefName: 'fix-login',
+    headOwnerLogin: 'acme',
+    fork: false,
+  });
+  assert.equal(listed.items.find((i) => i.number === 9).fork, true);
+  /* A fork PR must carry its head owner in the LIST response too: the hero
+     checks the fork's branch out as `<owner>/<headRef>`, so a list row without
+     it would be handled as a same-repo PR and get an origin upstream. */
+  assert.equal(
+    listed.items.find((i) => i.number === 9).headOwnerLogin,
+    'alice-dev',
+    'a fork row names the owner its local branch will be prefixed with',
+  );
+  assert.equal(listed.items.find((i) => i.number === 9).state, 'merged', 'gh states are lowercased');
+  assert.equal(listed.items.find((i) => i.number === 5).body, null);
+  assert.deepEqual(listed.items.find((i) => i.number === 5).labels, ['legacy-string'], 'string labels still flatten');
+  const issueRow = listed.items.find((i) => i.number === 31);
+  assert.equal(issueRow.kind, 'issue');
+  assert.deepEqual(issueRow.labels, ['bug']);
+  assert.equal('baseRefName' in issueRow, false, 'issue rows carry no PR fields');
+  assert.equal('headOwnerLogin' in issueRow, false, 'issue rows carry no PR fields');
+
+  // one item in full: `gh pr view` for a PR…
+  const detail = await pullRequestDetail({ cwd: prRepo, number: 12 });
+  assert.equal(detail.ok, true);
+  assert.equal(detail.item.kind, 'change_request');
+  assert.equal(detail.item.state, 'open');
+  assert.equal(detail.item.baseRefName, 'main');
+  assert.equal(detail.item.headRefName, 'fix-login');
+  assert.equal(detail.item.fork, false);
+  assert.equal(detail.item.headOwnerLogin, 'acme');
+  assert.deepEqual(detail.item.labels, ['bug', 'ready']);
+  // …and the fork flavour of it
+  const forkDetail = await pullRequestDetail({ cwd: prRepo, number: 9 });
+  assert.equal(forkDetail.item.fork, true);
+  assert.equal(forkDetail.item.headOwnerLogin, 'alice-dev');
+  // an issue number: `gh pr view` fails, `gh issue view` is the fallback
+  const asIssue = await pullRequestDetail({ cwd: prRepo, number: 31 });
+  assert.equal(asIssue.ok, true);
+  assert.equal(asIssue.item.kind, 'issue');
+  assert.equal(asIssue.item.title, 'Login page 500s on Safari');
+  const explicit = await pullRequestDetail({ cwd: prRepo, number: 12, kind: 'change_request' });
+  assert.equal(explicit.ok, true);
+  assert.equal(explicit.item.number, 12);
+  // a number neither subcommand knows
+  const missing = await pullRequestDetail({ cwd: prRepo, number: 404 });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.authState, 'error');
+  assert.match(missing.message, /no pull requests or issues matched/);
+});
+
+await test('api: /pulls + /pull over real HTTP (fake gh)', async () => {
+  rmSync(fakeGHLog, { force: true });
+  const hub = createGitStateHub({ onChange: () => {} });
+  const api = createApi(hub, {});
+  const server = http.createServer((req, res) => api.route.handler(req, res));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
+  try {
+    const get = async (path) => (await fetch(base + path)).json();
+
+    // 400s
+    const noCwd = await fetch(`${base}/pulls`);
+    assert.equal(noCwd.status, 400);
+    assert.equal((await noCwd.json()).error, 'cwd required');
+    for (const number of ['abc', '0', '1.5', '']) {
+      const bad = await fetch(`${base}/pull?cwd=${encodeURIComponent(prRepo)}&number=${number}`);
+      assert.equal(bad.status, 400, `number=${JSON.stringify(number)}`);
+      assert.equal((await bad.json()).error, 'number required');
+    }
+    assert.equal((await fetch(`${base}/pull?cwd=${encodeURIComponent(prRepo)}`)).status, 400);
+
+    // a non-git cwd never reaches the forge
+    assert.deepEqual(await get(`/pulls?cwd=${encodeURIComponent(scratch)}`), {
+      ok: true,
+      isGit: false,
+      items: [],
+      authState: 'no_remote',
+    });
+    const outsidePull = await get(`/pull?cwd=${encodeURIComponent(scratch)}&number=12`);
+    assert.equal(outsidePull.ok, false);
+    assert.equal(outsidePull.authState, 'no_remote');
+
+    // the listing: merged issues+PRs, newest first, limit forwarded to gh
+    const pulls = await get(`/pulls?cwd=${encodeURIComponent(prRepo)}&limit=7`);
+    assert.equal(pulls.ok, true);
+    assert.equal(pulls.isGit, true);
+    assert.equal(pulls.authState, 'authenticated');
+    assert.deepEqual(pulls.items.map((i) => i.number), [31, 12, 9, 21, 5]);
+    const logLines = readFileSync(fakeGHLog, 'utf8').trim().split('\n');
+    const prList = logLines.find((line) => line.includes('\tpr list '));
+    assert.ok(prList, `gh pr list was invoked: ${logLines.join(' | ')}`);
+    assert.ok(prList.startsWith(`${prRepo}\t`), `gh ran in the repo cwd: ${prList}`);
+    assert.ok(prList.endsWith('--limit 7'), `the limit is forwarded: ${prList}`);
+    /* The `--json` field list is a contract, not decoration: the fork's head
+       owner is what names a fork PR's local branch, so dropping it from the
+       request silently resolves the fork flag to null and checks the PR out
+       under the wrong branch name with a bogus origin upstream. */
+    assert.ok(prList.includes('headRepositoryOwner'), `the fork head owner is requested: ${prList}`);
+    assert.ok(prList.includes('isCrossRepository'), `the fork flag is requested: ${prList}`);
+    assert.ok(logLines.some((line) => line.includes('\tissue list ') && line.endsWith('--limit 7')));
+
+    // one PR
+    const pull = await get(`/pull?cwd=${encodeURIComponent(prRepo)}&number=12`);
+    assert.equal(pull.ok, true);
+    assert.equal(pull.item.kind, 'change_request');
+    assert.equal(pull.item.number, 12);
+    assert.equal(pull.item.state, 'open');
+    assert.equal(pull.item.baseRefName, 'main');
+    assert.equal(pull.item.headRefName, 'fix-login');
+    assert.equal(pull.item.fork, false);
+    assert.deepEqual(pull.item.labels, ['bug', 'ready']);
+    assert.equal(pull.item.url, 'https://github.com/acme/widget/pull/12');
+
+    // a fork PR reports its origin
+    const forkPull = await get(`/pull?cwd=${encodeURIComponent(prRepo)}&number=9`);
+    assert.equal(forkPull.ok, true);
+    assert.equal(forkPull.item.fork, true);
+    assert.equal(forkPull.item.headOwnerLogin, 'alice-dev');
+
+    // an issue number: `gh pr view` fails first, `gh issue view` answers
+    const issue = await get(`/pull?cwd=${encodeURIComponent(prRepo)}&number=31`);
+    assert.equal(issue.ok, true);
+    assert.equal(issue.item.kind, 'issue');
+    assert.equal(issue.item.title, 'Login page 500s on Safari');
+    assert.equal('baseRefName' in issue.item, false);
+    const issueExplicit = await get(`/pull?cwd=${encodeURIComponent(prRepo)}&number=31&kind=issue`);
+    assert.equal(issueExplicit.ok, true);
+    assert.equal(issueExplicit.item.kind, 'issue');
+
+    // a number gh does not know: a plain answer, never a 500
+    const gone = await get(`/pull?cwd=${encodeURIComponent(prRepo)}&number=404`);
+    assert.equal(gone.ok, false);
+    assert.equal(gone.authState, 'error');
+    assert.match(gone.message, /no pull requests or issues matched/);
+
+    // the route reports the auth state it got from the forge
+    process.env.FAKE_GH_UNAUTH = '1';
+    invalidateGhAuth();
+    const gate = await get(`/pulls?cwd=${encodeURIComponent(prRepo)}`);
+    assert.equal(gate.ok, true);
+    assert.deepEqual(gate.items, []);
+    assert.equal(gate.authState, 'unauthenticated');
+    delete process.env.FAKE_GH_UNAUTH;
+    invalidateGhAuth();
   } finally {
     api.dispose();
     server.close();
