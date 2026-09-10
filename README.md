@@ -6,9 +6,12 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 ## What it adds
 
 1. **Hero worktree staging** — when the current (blank) session's workspace is
-   a git repo, a `本地` dropdown appears in the hero row between the workspace
-   chip and the 模式 control; it offers `新建 worktree`, which reveals the
-   base-branch picker. **The picker speaks exact refs (paseo parity)**: the
+   a git repo, a mode dropdown appears in the hero row between the workspace
+   chip and the 模式 control; it offers `本地` (the workspace root IS the
+   repository checkout — the default) and `新建 worktree`, which reveals the
+   base-branch picker. Picking `本地` again leaves staging with no side effect,
+   so the picker is never a dead end, and the trigger label always shows the
+   active mode. **The picker speaks exact refs (paseo parity)**: the
    `origin/<name>` row comes first because it IS the default base — cutting
    from `refs/remotes/origin/<name>` starts at the true GitHub head even when
    the local branch lags; diverged locals appear as `<name>（本地）` rows with
@@ -17,12 +20,16 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    bounded 4 s `git fetch --prune` head start (on top of the 180 s background
    fetch — paseo itself never fetches at create time), cuts the mnemonic
    placeholder branch, registers a Workspace titled
-   `<source workspace> · <branch>`, creates the target session, migrates the
+   `<source workspace> · <branch>` (renamed as the very next call after
+   registration, so the row does not linger on the placeholder-branch title),
+   creates the target session, migrates the
    typed draft through the official conversation-input API, opens it and
    retires the blank launcher — with full rollback on any failure. On the
    first user message one LLM call renames the branch to a task slug AND
    titles the session (hosts after restart), and the workspace title follows
-   as `<source> · <session title>`. Inside a worktree workspace the hero
+   as `<source> · <session title>` — only ever for the workspace owning the
+   current session's cwd, since every git detection result is tagged with the
+   cwd it was resolved for. Inside a worktree workspace the hero
    control hides entirely, and the sidebar row trades its folder icon for a
    branch icon. Abandoned staging leftovers are swept automatically
    (boot + hourly) or via `POST /worktrees/cleanup`.
