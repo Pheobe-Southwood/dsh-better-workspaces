@@ -50,11 +50,10 @@ hero 这一侧的语义来自 paseo 的 `checkout-change-request`：PR 不是基
 + `subscribeLexicon`；候选钩子**必须存在但回答空列表**（`candidates: async () => []`）：
 选择器就是这个来源的门，本来源不给原生 `@` 菜单贡献任何候选行——省掉 hook 则是另一种
 后果，见 Consequences 第 4 条。词表只列**本会话真的挂过**的编号，而不是所有见过的条目：
-装饰范围因此收敛在本插件自己挂上的引用上，用户手打的编号不会被顺手吞成引用。挂引用与
-退化写入都会立刻让装饰扫描重取（`subscribeLexicon` 是词表变化的通知通道）。来源必须与
-插件同生命周期（chip 的来源没有序列化器时，发送 fail-loud 而不是降级）。降级：官方的
-`insertReference` 因 revision CAS 或输入阶段拒绝写入时，退回 `setDraft` 追加纯文本，
-写入的是**模型形态正文**（标题 / URL / Base / Head / body），理由见 B5。
+装饰范围因此收敛在本插件自己挂上的引用上，用户手打的编号不会被顺手吞成引用。挂引用会
+立刻让装饰扫描重取（`subscribeLexicon` 是词表变化的通知通道）。来源必须与插件同生命周期
+（chip 的来源没有序列化器时，发送 fail-loud 而不是降级）。引用写入是**原子操作**：
+`insertReference` 因 revision CAS、输入阶段或坐标拒绝时，草稿保持不变并提示重试，理由见 B5。
 
 **B1. 显示形态是 `#N`，而 `trigger` 必须保持 `@`。**
 `TriggerChar` 的官方定义是 `'/' | '@'`——`#` **不可能**作为触发符；`trigger` 字段是词表的
@@ -78,7 +77,7 @@ var UiConversation = class extends Service { ... }              // super(ctx, "u
 `uiConversation` 只是官方 apply 里的**局部变量名**（`const uiConversation = new UiConversation(...)`），
 从来不是服务键。因此 `appCtx.get("uiConversation")` 永远返回 undefined，而解析器里的
 `if (!conversation || !conversation.input) return null` 会在**任何点击之前**就把整条链短路：
-`sessionInput = null` → `insertReference` 与 `setDraft` 两步都被跳过 → 点击表现为完全无事发生。
+`sessionInput = null` → `insertReference` 被跳过 → 点击表现为完全无事发生。
 这个键错误此前**无法被任何静态检查发现**：`ctx.get` 对未知名返回 undefined 而不是抛错，而
 `uiConversation` 这个名字在官方源码里到处可见（它是局部变量与另一个真实服务名），看起来完全合理。
 
@@ -90,34 +89,45 @@ var UiConversation = class extends Service { ... }              // super(ctx, "u
 对 `"uiConversation"` 明确返回 undefined；另有静态断言（先剥注释，因为注释里按名字写了错误键）
 要求源码中出现 `.get("conversation")` 且不出现 `.get("uiConversation")`。
 
-**B3. 写入路径的两个契约事实（第一版都踩了，见 ADR 0009）。**
-命中一行到草稿里出现小片，中间只有两次官方调用，而两次都要求调用方知道契约：
+**B3. 写入路径的坐标契约（先后踩了两版，见 ADR 0009）。**
+命中一行到草稿里出现小片，中间的官方调用要求调用方知道三个事实：
 其一，**解析会话输入必须用 `sessions.scope(id)` 拿到的 ctx**——`conversation.input.for(actx)`
 内部走 `sessions.scopeOf(ctx)`，读的是 sessions 服务自己打在**每会话 ctx** 上的私有 tag；
 会话*binding* 上没有这个 tag，传进去会抛「requires a session scope」，而调用点若把异常
-吞掉就变成**完全没反应**。其二，**插入点必须取 shell 自己的 `caretSpan()`**（无选区时回答
-`detectText.length`，即草稿末尾，同时带来最新的 `draftRev`），不能拿
-`InputState.occurrences` 手算：occurrence 的 `offset` 与 `length` 中，`offset` 是 detect
-投影坐标而 `length` 是**剪贴板投影**长度，chip 在 detect 投影里占 **0** 个字符，于是
-`offset + length` 在草稿里有第一个 chip 时就冲过末尾。两条都做成了可离线复现的断言
-（`attachForgeReference` / `resolveForgeSessionInput` 从 `__bwTest` 出），因为这两处的
-失败方式都是静默的。
+吞掉就变成**完全没反应**。其二，`caretSpan()` 与 `insertReference` 使用 detect 坐标，
+`draft` 与 occurrence 的 `offset` / `length` 则**全部使用 clipboard 坐标**（官方
+`Occurrence` 类型注释逐项明确），绝不能混算。其三，官方 `$composerLayout()` 把每个 chip
+固定投影为 **1 个 `U+FFFC` 对象替代字符**，而不是 0 个字符：
+
+```text
+detectEnd = draft.length - Σ(occurrence.length - 1)
+```
+
+旧 `draftEnd()` 使用 `offset + draft.length - clipboardText.length`。已有 0 个 chip 时算对 0；
+已有 1 个 `#803` chip 时算出 1（实际 2，但仍在合法范围，`caretSpan()` 的实时 2 因宽松的
+`>=` 判定被采用）；已有 2 个 chip 时却算出 10（实际 4），于是**恰好从第三次选择开始**把
+越界 span 交给 `insertReference`。官方 `$replaceDetectSpanWithNodes` 无法选择该范围，返回
+false，随后旧纯文本兜底把模型正文展开到输入框——这就是第三个引用突然展开的完整因果链。
+
+现在 `referenceDetectEnd` 对 occurrence 的排序、重叠、边界与整数性做校验，并按上式换算；
+`forgeInsertSpan` 优先读取点击时 `target.snapshot`，revision 取 shell 的 `rev`，且只有
+`caretSpan()` 是**严格等于** detect 末尾的塌缩光标时才采用。相关纯函数和三连插入从
+`__bwTest` 导出，离线复现不再依赖浏览器。
 
 
 **B4. 失败必须自己上报，因为官方这条路径用「返回 false」而不是异常。**
-从「点中一行」到「屏幕上出现 chip」之间至少四个静默出口：`resolveForgeSessionInput` 自己的
-catch、`insertReference` 用 `return false` 表达拒绝（phase 不是 plain/claimed、span 的
-`draftRev` 与 shell 的 CAS 不符）、`setDraft` 在「清洗后与当前草稿相同」时**直接 return**
-不写入、以及降级路径的 catch。任何一处生效，点击都会表现为「什么都没有发生」，而调用方
-无法区分是哪一处。因此本控件对**两条路都失败**的情况调用官方的输入框提示通道
-`shell.notify("error", t("forge.attachFailed", { reason }))`（`notify` 是 `SessionInput`
-的公开成员，官方自身也用它报队列/命令失败），把静默变成可见。
-配套的诊断通道：`localStorage.setItem("dsh-bw-debug", "1")` 后刷新页面，`forgeTrace` 会把
-`resolve → resolve.shell → caret → insert → fallback → done` 每一步的判定值打到
+从「点中一行」到「屏幕上出现 chip」之间仍有静默出口：`resolveForgeSessionInput` 自己的
+catch、投影校验失败，以及 `insertReference` 用 `return false` 表达拒绝（phase 不是
+plain/claimed、span 的 `draftRev` 与 shell 的 CAS 不符、或 detect span 无效）。任何一处
+生效，点击都会表现为「什么都没有发生」，而调用方无法区分是哪一处。因此失败统一调用官方
+输入框提示通道 `shell.notify("error", t("forge.attachFailed", { reason }))`（`notify` 是
+`SessionInput` 的公开成员，官方自身也用它报队列/命令失败），并保持 picker 打开供重试。
+配套诊断通道：`localStorage.setItem("dsh-bw-debug", "1")` 后刷新页面，`forgeTrace` 会把
+`resolve → resolve.shell → caret/span.invalid → insert → done → pick` 每一步的判定值打到
 `console.warn("[better-workspaces:forge]", …)`；关闭时零开销，`localStorage` 不可用时
 静默关闭（Node 测试里天然关着）。
 
-**B5. 纯文本引用 token 永远不会被展开——降级必须自带正文。**
+**B5. 纯文本不是可接受降级——引用插入必须原子化。**
 发送路径 `sinkSerialized` 展开的是**编辑器里的 chip 节点**，不是草稿文字：
 
 ```js
@@ -128,19 +138,24 @@ Promise.all(occurrences.map(o => ({
 })));
 ```
 
-因此：`codec.clipboardText` 换成 `#N` **不影响**模型侧全文（路由靠 chip 的
-`source`/`ref`，与投影文字无关）；但反过来，**没有 chip 就没有展开**——一个裸的 `#N`
-纯文本会被原样发给模型，没有标题、没有链接、没有正文。原先的降级实现写的正是这种裸
-token，旁边那句「still expands through the codec on send」是错的，本 ADR 在此更正。现在
-降级写入 `renderForgeReferenceText(item)` 的正文（追加到草稿末尾，`settleSink` 会对最终
-文本 `trim()`，所以收拢尾部空白不影响模型看到的内容）。
+因此 `codec.clipboardText` 是 `#N` **不影响**模型侧全文（路由靠 chip 的 `source`/`ref`，与
+投影文字无关）；但反过来，**没有 chip 就没有 codec 展开**。曾有两个逐步补丁：第一版失败时
+写裸 `#N`，模型只拿到编号；第二版为了保住模型上下文改写 `renderForgeReferenceText(item)`
+正文，却破坏了“草稿中只显示一个小片”的产品契约。本次第三个 chip 的坐标 bug 证明，这种
+兜底会把任何内部拒绝变成用户可见的大段正文，不能保留。
+
+最终决定是原子化：`attachForgeReference` 只尝试 `insertReference`；成功才关闭 picker，失败
+不调用 `setDraft`、不改草稿、显示原因并保持 picker 打开供重试。模型全文只在真实 chip 成功
+进入编辑器后由 codec 生成。
 
 **B6. 插入点由「草稿末尾」决定，而不是当前光标。**
 `caretSpan()` 有选区时返回选区：选择器是对话框，用户点它时光标可能停在正文中间，照搬会让
-chip 把已有文字切开。本控件的语义因此是「追加」——只有当 `caretSpan()` 给的是草稿末尾的
-塌缩光标时才采用它，否则回落到重算的草稿末尾。span 的 `draftRev` **始终取 shell 自己的
-`rev`**（`caretSpan()` 不返回 rev），而不是组件渲染期的 `InputState.draftRev`：后者只要比
-shell 落后一次编辑，CAS 就会拒绝，症状同样是静默。
+chip 把已有文字切开。本控件的语义因此是「追加」——只有当 `caretSpan()` 给的是与
+`referenceDetectEnd(target.snapshot)` **严格相等**的塌缩光标时才采用它，否则使用按 B3
+公式重算的实时末尾。span 的 `draftRev` 始终取 shell 自己的 `rev`（`caretSpan()` 不返回
+rev），而不是组件渲染期的 `InputState.draftRev`：后者只要比 shell 落后一次编辑，CAS 就会
+拒绝。实时 snapshot 不可用时才读 render snapshot；两份投影都无法验证时直接失败并提示，
+绝不猜测坐标。
 
 **C. PR 行 = 检出 head，绝不是可切的基。**
 `pr-checkout` 取 forge 的通用 head ref `refs/pull/<N>/head`（origin 优先、upstream
