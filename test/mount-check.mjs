@@ -32,7 +32,7 @@ for (const spec of MODULES) {
   }
 }
 
-function fakeCtx({ withWebServer }) {
+function fakeCtx({ withWebServer, registerThrows = false }) {
   const effects = [];
   const logs = [];
   const webServer = withWebServer
@@ -40,6 +40,7 @@ function fakeCtx({ withWebServer }) {
         register(route) {
           assert.equal(route.kind, 'prefix');
           assert.equal(route.path, '/better-workspaces/api');
+          if (registerThrows) throw new Error('duplicate route');
           return () => {};
         },
         registerFallback() {
@@ -55,6 +56,7 @@ function fakeCtx({ withWebServer }) {
     ctx: {
       get(name) {
         if (name === 'webServer') return webServer;
+        if (name === 'workspaceRegistry') return { list: () => [] };
         return undefined; // every optional service absent → dormant/degraded paths
       },
       on() {
@@ -77,14 +79,13 @@ function fakeCtx({ withWebServer }) {
 
 const plugin = await import('../lib/index.js');
 
-// Cold-boot regression guard: the row MUST declare webServer as a hard
-// dependency. With inject:[] the row activated before the web app provided
-// the service, took the dormant branch, and never registered its routes —
-// every cold boot lost the whole plugin (ADR 0005).
+// Cold-boot/security regression guard: routes need both the server and the
+// durable Workspace registry. Without either hard dependency the plugin could
+// mount dormant or authorize against an empty/fail-open source.
 assert.deepEqual(
   [...(plugin.inject ?? [])],
-  ['webServer'],
-  'host plugin must inject webServer so cordis waits for it on cold boot',
+  ['webServer', 'workspaceRegistry'],
+  'host plugin must wait for webServer and its authorization registry',
 );
 
 /* ---------------- bundle wiring: `dsh plugin add` is the whole install --------
@@ -158,6 +159,43 @@ for (const withWebServer of [false, true]) {
   } catch (e) {
     console.log(`APPLY FAIL (webServer=${withWebServer})\n${e && e.stack ? e.stack : e}`);
     process.exit(1);
+  }
+}
+
+// A duplicate route must dispose the API heartbeat immediately; the simulated
+// Cordis rollback then disposes effects registered before the failing one.
+{
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const intervals = new Set();
+  globalThis.setInterval = () => {
+    const token = {};
+    intervals.add(token);
+    return token;
+  };
+  globalThis.clearInterval = (token) => {
+    intervals.delete(token);
+  };
+  try {
+    const { ctx, effects } = fakeCtx({ withWebServer: true, registerThrows: true });
+    plugin.apply(ctx);
+    const disposers = [];
+    let failure = null;
+    for (const entry of effects) {
+      try {
+        const disposer = entry.factory();
+        if (typeof disposer === 'function') disposers.push(disposer);
+      } catch (error) {
+        failure = error;
+        break;
+      }
+    }
+    assert.match(String(failure?.message || failure), /duplicate route/);
+    for (const disposer of disposers.reverse()) await disposer();
+    assert.equal(intervals.size, 0, 'failed registration cannot leak hub/API intervals');
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
   }
 }
 
