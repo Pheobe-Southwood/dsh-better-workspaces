@@ -46,17 +46,27 @@ hero 这一侧的语义来自 paseo 的 `checkout-change-request`：PR 不是基
 `codec.serialize`，展开为 paseo 的 `renderChangeRequestAttachment` /
 `renderIssueAttachment` 文本——PR：`GitHub PR #N: <title>`、URL、`Base: <base>`、
 `Head: <head>`、空行、正文；issue：`GitHub Issue #N: <title>`、URL、空行、正文。
-来源只发布 `codec`（`clipboardText` → `@N`，异步 `serialize`）与词表两件套 `lexicon`
+来源只发布 `codec`（`clipboardText` → `#N`，异步 `serialize`）与词表两件套 `lexicon`
 + `subscribeLexicon`；候选钩子**必须存在但回答空列表**（`candidates: async () => []`）：
 选择器就是这个来源的门，本来源不给原生 `@` 菜单贡献任何候选行——省掉 hook 则是另一种
 后果，见 Consequences 第 4 条。词表只列**本会话真的挂过**的编号，而不是所有见过的条目：
 装饰范围因此收敛在本插件自己挂上的引用上，用户手打的编号不会被顺手吞成引用。挂引用与
 退化写入都会立刻让装饰扫描重取（`subscribeLexicon` 是词表变化的通知通道）。来源必须与
 插件同生命周期（chip 的来源没有序列化器时，发送 fail-loud 而不是降级）。降级：官方的
-`insertReference` 因 revision CAS 或输入阶段拒绝写入时，退回 `setDraft` 追加纯文本
-`@N`；装饰扫描按词表把 `@N` 重新渲染成 chip，代价只是光标落在草稿末尾。
+`insertReference` 因 revision CAS 或输入阶段拒绝写入时，退回 `setDraft` 追加纯文本，
+写入的是**模型形态正文**（标题 / URL / Base / Head / body），理由见 B5。
 
-**B1. 服务键是 `conversation`，不是 `uiConversation` —— 这是「点了没反应」的真正原因。**
+**B1. 显示形态是 `#N`，而 `trigger` 必须保持 `@`。**
+`TriggerChar` 的官方定义是 `'/' | '@'`——`#` **不可能**作为触发符；`trigger` 字段是词表的
+键域，候选聚合也按它分桶，塞 `#` 进去会让聚合出错。但用户看到的标记来自
+`codec.clipboardText`，官方对该字段的注释写得很明确：
+`Clipboard / persistence projection, e.g. /name (never the model form)`——它本就不必等于
+触发符。两者故意不同正是本节的要点：`@` 是所有官方 `@` 类来源（文件 / 引用 / cordis）的
+唤醒符，`@N` 形态的小片会和官方附件菜单抢同一个按键（用户实际遇到的现象：出现引用片的
+同时弹出附件候选）。改成 `#N` 后 `#` 不是任何触发符，既不唤醒官方菜单，也不与 Markdown
+的 `#` 标题冲突。
+
+**B2. 服务键是 `conversation`，不是 `uiConversation` —— 这是「点了没反应」的真正原因。**
 官方 `dsh-client-ui-conversation` 注册了**两个不同的服务类**，只有一个带 `SessionInputResolver`：
 
 ```js
@@ -80,7 +90,7 @@ var UiConversation = class extends Service { ... }              // super(ctx, "u
 对 `"uiConversation"` 明确返回 undefined；另有静态断言（先剥注释，因为注释里按名字写了错误键）
 要求源码中出现 `.get("conversation")` 且不出现 `.get("uiConversation")`。
 
-**B2. 写入路径的两个契约事实（第一版都踩了，见 ADR 0009）。**
+**B3. 写入路径的两个契约事实（第一版都踩了，见 ADR 0009）。**
 命中一行到草稿里出现小片，中间只有两次官方调用，而两次都要求调用方知道契约：
 其一，**解析会话输入必须用 `sessions.scope(id)` 拿到的 ctx**——`conversation.input.for(actx)`
 内部走 `sessions.scopeOf(ctx)`，读的是 sessions 服务自己打在**每会话 ctx** 上的私有 tag；
@@ -94,7 +104,7 @@ var UiConversation = class extends Service { ... }              // super(ctx, "u
 失败方式都是静默的。
 
 
-**B3. 失败必须自己上报，因为官方这条路径用「返回 false」而不是异常。**
+**B4. 失败必须自己上报，因为官方这条路径用「返回 false」而不是异常。**
 从「点中一行」到「屏幕上出现 chip」之间至少四个静默出口：`resolveForgeSessionInput` 自己的
 catch、`insertReference` 用 `return false` 表达拒绝（phase 不是 plain/claimed、span 的
 `draftRev` 与 shell 的 CAS 不符）、`setDraft` 在「清洗后与当前草稿相同」时**直接 return**
@@ -107,7 +117,25 @@ catch、`insertReference` 用 `return false` 表达拒绝（phase 不是 plain/c
 `console.warn("[better-workspaces:forge]", …)`；关闭时零开销，`localStorage` 不可用时
 静默关闭（Node 测试里天然关着）。
 
-**B4. 插入点由「草稿末尾」决定，而不是当前光标。**
+**B5. 纯文本引用 token 永远不会被展开——降级必须自带正文。**
+发送路径 `sinkSerialized` 展开的是**编辑器里的 chip 节点**，不是草稿文字：
+
+```js
+const occurrences = this.projection.occurrences;         // 只由真实 chip 节点产生
+if (occurrences.length === 0) { …原样发出 draft.trim()… }  // 纯文本走这条
+Promise.all(occurrences.map(o => ({
+  text: await inputTriggers.serializeReference(o.source, o.ref, …)   // 按 source/ref 路由
+})));
+```
+
+因此：`codec.clipboardText` 换成 `#N` **不影响**模型侧全文（路由靠 chip 的
+`source`/`ref`，与投影文字无关）；但反过来，**没有 chip 就没有展开**——一个裸的 `#N`
+纯文本会被原样发给模型，没有标题、没有链接、没有正文。原先的降级实现写的正是这种裸
+token，旁边那句「still expands through the codec on send」是错的，本 ADR 在此更正。现在
+降级写入 `renderForgeReferenceText(item)` 的正文（追加到草稿末尾，`settleSink` 会对最终
+文本 `trim()`，所以收拢尾部空白不影响模型看到的内容）。
+
+**B6. 插入点由「草稿末尾」决定，而不是当前光标。**
 `caretSpan()` 有选区时返回选区：选择器是对话框，用户点它时光标可能停在正文中间，照搬会让
 chip 把已有文字切开。本控件的语义因此是「追加」——只有当 `caretSpan()` 给的是草稿末尾的
 塌缩光标时才采用它，否则回落到重算的草稿末尾。span 的 `draftRev` **始终取 shell 自己的
