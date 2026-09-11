@@ -3,8 +3,8 @@
  * a temp dir with DSH_HOME redirected, no harness needed. `npm test`.
  */
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, statSync, renameSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,14 +14,16 @@ const scratch = mkdtempSync(join(tmpdir(), 'dsh-bw-test-'));
 process.env.DSH_HOME = join(scratch, 'dshhome');
 mkdirSync(process.env.DSH_HOME, { recursive: true });
 
-const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind, runGit, listCommits, unpushedShas } = await import('../lib/git.js');
-const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, repoWorktreesRoot, worktreesRoot } = await import('../lib/worktree.js');
+const { detectRepo, resolveDefaultBranch, listBranches, currentBranchInfo, diffStat, porcelainStatus, aheadBehind, runGit, listCommits, unpushedShas } = await import('../lib/git.js');
+const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree } = await import('../lib/worktree.js');
 const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
-const { commitAction, pullAction, pushAction, discardAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
+const { commitAction, pullAction, pushAction, discardAction, updateFromBaseAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
 const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable } = await import('../lib/forge.js');
+const { createCleanupScheduler } = await import('../lib/index.js');
+const { hostMutationCoordinator } = await import('../lib/mutation.js');
 
 function git(cwd, ...args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' });
@@ -89,6 +91,31 @@ await test('runGit accepted exits never hide process failures', async () => {
   const timedOut = await runGit(['-c', 'alias.wait=!sleep 1', 'wait'], { cwd: repo, timeout: 20, acceptedExitCodes: [0, 1] });
   assert.equal(timedOut.ok, false, 'killed/time-limited processes always fail');
   assert.equal(timedOut.timedOut, true);
+
+  const guarded = await runGit(['rev-parse', '--verify', 'HEAD'], { cwd: repo, parentGuard: true });
+  assert.equal(guarded.ok, true, guarded.stderr);
+});
+
+await test('parent-guarded Git cannot outlive a killed Host worker', async () => {
+  const bin = join(scratch, 'parent-guard-bin');
+  const started = join(scratch, 'parent-guard-started');
+  const finished = join(scratch, 'parent-guard-finished');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'git'), `#!/bin/sh\ncase " $* " in\n  *" config --includes --show-scope --name-only -z --get-regexp "*) exec /usr/bin/git "$@" ;;\nesac\necho started > ${JSON.stringify(started)}\nsleep 2\necho finished > ${JSON.stringify(finished)}\nexec /usr/bin/git "$@"\n`);
+  chmodSync(join(bin, 'git'), 0o755);
+  const worker = spawn(process.execPath, ['test/git-parent-worker.mjs', repo, bin], {
+    cwd: new URL('..', import.meta.url),
+    stdio: 'ignore',
+  });
+  const deadline = Date.now() + 3000;
+  while (!existsSync(started) && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(existsSync(started), true, 'guarded Git fixture started');
+  worker.kill('SIGKILL');
+  await new Promise((resolveExit) => worker.once('exit', resolveExit));
+  await new Promise((resolveWait) => setTimeout(resolveWait, 2200));
+  assert.equal(existsSync(finished), false, 'orphaned Git process group was killed before side effects');
 });
 
 await test('read-only Git ignores repository fsmonitor executables', async () => {
@@ -322,7 +349,7 @@ await test('pull never aborts a pre-existing merge', async () => {
   git(merging, 'merge', '--abort');
 });
 
-await test('pull.rebase config cannot leave partial rebase state', async () => {
+await test('pull pins merge mode and preserves conflicts for explicit recovery', async () => {
   const local = join(scratch, 'pull-local');
   const remote = join(scratch, 'pull-remote.git');
   const peer = join(scratch, 'pull-peer');
@@ -347,11 +374,14 @@ await test('pull.rebase config cannot leave partial rebase state', async () => {
   git(local, 'config', 'pull.rebase', 'true');
   const result = await pullAction(local);
   assert.equal(result.ok, false);
-  assert.equal(result.partial, undefined, JSON.stringify(result));
-  assert.equal(readFileSync(join(local, 'conflict.txt'), 'utf8'), 'local\n');
-  assert.equal(git(local, 'status', '--porcelain').trim(), '');
+  assert.equal(result.partial, true, JSON.stringify(result));
+  assert.equal(result.stage, 'merge-conflict-preserved');
+  assert.ok(tryGit(local, 'rev-parse', '--verify', '--quiet', 'MERGE_HEAD'));
+  assert.notEqual(git(local, 'status', '--porcelain').trim(), '');
   assert.equal(existsSync(join(local, '.git', 'rebase-merge')), false);
   assert.equal(existsSync(join(local, '.git', 'rebase-apply')), false);
+  git(local, 'merge', '--abort');
+  assert.equal(readFileSync(join(local, 'conflict.txt'), 'utf8'), 'local\n');
 });
 
 let wt1;
@@ -367,8 +397,18 @@ await test('createWorktree branch-off', async () => {
   assert.equal(meta.autoName.status, 'ineligible');
 });
 
-await test('createWorktree rolls back add and branch when metadata commit fails', async () => {
+await test('startup recovery removes abandoned temporary PR refs', async () => {
+  const leakedRef = 'refs/dsh-better-workspaces/pr/injected-crash-ref';
+  git(repo, 'update-ref', leakedRef, 'HEAD');
+  const recovered = await recoverPendingTransactions(repo);
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.ok(recovered.recovered.some((entry) => entry.ref === leakedRef));
+  assert.equal(git(repo, 'for-each-ref', '--format=%(refname)', 'refs/dsh-better-workspaces/pr/').trim(), '');
+});
+
+await test('createWorktree preserves post-add failures for manual recovery', async () => {
   const expectedPath = join(await repoWorktreesRoot(repo), 'metadata-failure');
+  writeFileSync(join(repo, '.git', 'info', 'exclude'), '*.secret\n');
   await assert.rejects(
     createWorktree({
       repoRoot: repo,
@@ -376,12 +416,177 @@ await test('createWorktree rolls back add and branch when metadata commit fails'
       intent: 'branch-off',
       branchName: 'metadata-failure',
       slug: 'metadata-failure',
-      metadataWriter: async () => { throw new Error('injected metadata failure'); },
+      metadataWriter: async (path) => {
+        writeFileSync(join(path, 'valuable.secret'), 'preserve me\n');
+        throw new Error('injected metadata failure');
+      },
     }),
-    /injected metadata failure/,
+    /injected metadata failure.*preserved for manual recovery/,
   );
-  assert.equal(existsSync(expectedPath), false);
+  assert.equal(readFileSync(join(expectedPath, 'valuable.secret'), 'utf8'), 'preserve me\n');
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/metadata-failure'], { cwd: repo })).ok, true);
+  git(repo, 'worktree', 'remove', '--force', expectedPath);
+  assert.equal((await recoverPendingTransactions(repo)).ok, true);
   assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/metadata-failure'], { cwd: repo })).ok, false);
+
+  const noOpPath = join(await repoWorktreesRoot(repo), 'metadata-noop');
+  await assert.rejects(
+    createWorktree({
+      repoRoot: repo,
+      base: 'main',
+      intent: 'branch-off',
+      branchName: 'metadata-noop',
+      slug: 'metadata-noop',
+      metadataWriter: async () => {},
+    }),
+    /creation postcondition failed.*preserved for manual recovery/,
+  );
+  assert.equal(existsSync(noOpPath), true);
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/metadata-noop'], { cwd: repo })).ok, true);
+  git(repo, 'worktree', 'remove', '--force', noOpPath);
+  assert.equal((await recoverPendingTransactions(repo)).ok, true);
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/metadata-noop'], { cwd: repo })).ok, false);
+
+  const preservedPath = join(await repoWorktreesRoot(repo), 'rollback-remove-failure');
+  await assert.rejects(
+    createWorktree({
+      repoRoot: repo,
+      base: 'main',
+      intent: 'branch-off',
+      branchName: 'rollback-remove-failure',
+      slug: 'rollback-remove-failure',
+      metadataWriter: async () => { throw new Error('metadata failed after worktree add'); },
+    }),
+    /rollback failed: remove: added worktree preserved for manual recovery/,
+  );
+  assert.equal(existsSync(preservedPath), true, 'failed teardown preserves the worktree path');
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/rollback-remove-failure'], { cwd: repo })).ok, true, 'failed teardown preserves its checked-out branch');
+  const preservedRecovery = await recoverPendingTransactions(repo);
+  assert.equal(preservedRecovery.ok, false, JSON.stringify(preservedRecovery));
+  assert.equal(preservedRecovery.errors[0].stage, 'added-artifact-preserved');
+  assert.equal(existsSync(preservedPath), true, 'startup recovery never deletes a surviving path');
+  git(repo, 'worktree', 'remove', '--force', preservedPath);
+  const recovered = await recoverPendingTransactions(repo);
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.deepEqual(recovered.recovered, [{ path: preservedPath, action: 'rolled-back' }]);
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/rollback-remove-failure'], { cwd: repo })).ok, false);
+
+  await assert.rejects(
+    createWorktree({
+      repoRoot: repo,
+      base: 'main',
+      intent: 'branch-off',
+      branchName: 'prepared-journal-victim',
+      beforeAdd: async ({ expectedOid }) => {
+        git(repo, 'update-ref', 'refs/heads/prepared-journal-victim', expectedOid);
+        throw new Error('crash before worktree add');
+      },
+    }),
+    /crash before worktree add/,
+  );
+  const preparedRecovery = await recoverPendingTransactions(repo);
+  assert.equal(preparedRecovery.ok, true, JSON.stringify(preparedRecovery));
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/prepared-journal-victim'], { cwd: repo })).ok, true, 'prepared journal must not claim a future same-name branch');
+  git(repo, 'branch', '-D', 'prepared-journal-victim');
+});
+
+await test('recovery refuses a same-path replacement main repository', async () => {
+  const ownerRepo = join(scratch, 'owner-identity-repo');
+  const movedRepo = join(scratch, 'owner-identity-repo-old');
+  mkdirSync(ownerRepo);
+  git(ownerRepo, 'init', '-b', 'main');
+  git(ownerRepo, 'config', 'user.email', 'test@dsh.local');
+  git(ownerRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(ownerRepo, 'base.txt'), 'base\n');
+  git(ownerRepo, 'add', '-A');
+  git(ownerRepo, 'commit', '-m', 'base');
+  const orphanPath = join(await repoWorktreesRoot(ownerRepo), 'owner-orphan');
+  await assert.rejects(createWorktree({
+    repoRoot: ownerRepo,
+    intent: 'branch-off',
+    branchName: 'owner-orphan',
+    metadataWriter: async () => { throw new Error('leave owner journal'); },
+  }), /preserved for manual recovery/);
+  git(ownerRepo, 'worktree', 'remove', '--force', orphanPath);
+  renameSync(ownerRepo, movedRepo);
+  cloneRepo(movedRepo, ownerRepo);
+  git(ownerRepo, 'branch', 'owner-orphan', 'HEAD');
+  const recovery = await recoverPendingTransactions(ownerRepo);
+  assert.equal(recovery.ok, false, JSON.stringify(recovery));
+  assert.equal(recovery.errors[0].stage, 'repo-owner-changed');
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/owner-orphan'], { cwd: ownerRepo })).ok, true);
+  rmSync(await repoWorktreesRoot(ownerRepo), { recursive: true, force: true });
+});
+
+await test('update-from-base preserves conflicts and never aborts external recovery', async () => {
+  const mergeRepo = join(scratch, 'owned-merge-repo');
+  mkdirSync(mergeRepo);
+  git(mergeRepo, 'init', '-b', 'main');
+  git(mergeRepo, 'config', 'user.email', 'test@dsh.local');
+  git(mergeRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(mergeRepo, 'conflict.txt'), 'base\n');
+  git(mergeRepo, 'add', '-A');
+  git(mergeRepo, 'commit', '-m', 'base');
+  const task = await createWorktree({ repoRoot: mergeRepo, base: 'main', intent: 'branch-off', branchName: 'owned-conflict' });
+  try {
+    writeFileSync(join(task.path, 'conflict.txt'), 'task\n');
+    git(task.path, 'commit', '-am', 'task');
+    writeFileSync(join(mergeRepo, 'conflict.txt'), 'main\n');
+    git(mergeRepo, 'commit', '-am', 'main');
+    const before = git(task.path, 'rev-parse', 'HEAD').trim();
+    const result = await updateFromBaseAction(task.path);
+    assert.equal(result.ok, false);
+    assert.equal(result.reasonKey, 'actions.merge.conflict');
+    assert.equal(result.partial, true, JSON.stringify(result));
+    assert.equal(result.stage, 'merge-conflict-preserved');
+    assert.equal(git(task.path, 'rev-parse', 'HEAD').trim(), before);
+    assert.ok(tryGit(task.path, 'rev-parse', '--verify', '--quiet', 'MERGE_HEAD'));
+    git(task.path, 'merge', '--abort');
+    assert.equal(git(task.path, 'status', '--porcelain').trim(), '');
+
+    let foreignFailed = false;
+    try {
+      execFileSync('git', ['merge', '--no-edit', 'main'], { cwd: task.path, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      foreignFailed = true;
+    }
+    assert.equal(foreignFailed, true, 'fixture must leave a pre-existing conflicting merge');
+    const mergeHead = tryGit(task.path, 'rev-parse', '--verify', '--quiet', 'MERGE_HEAD');
+    assert.ok(mergeHead);
+    const guarded = await updateFromBaseAction(task.path);
+    assert.equal(guarded.ok, false);
+    assert.equal(tryGit(task.path, 'rev-parse', '--verify', '--quiet', 'MERGE_HEAD')?.trim(), mergeHead.trim());
+    git(task.path, 'merge', '--abort');
+  } finally {
+    await archiveWorktree(task.path, { force: true });
+  }
+});
+
+await test('branch-off uses the immutable base OID across a moving branch', async () => {
+  const movingRepo = join(scratch, 'moving-base-repo');
+  mkdirSync(movingRepo);
+  git(movingRepo, 'init', '-b', 'main');
+  git(movingRepo, 'config', 'user.email', 'test@dsh.local');
+  git(movingRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(movingRepo, 'base.txt'), 'one\n');
+  git(movingRepo, 'add', '-A');
+  git(movingRepo, 'commit', '-m', 'base one');
+  let capturedOid = null;
+  const task = await createWorktree({
+    repoRoot: movingRepo,
+    base: 'main',
+    intent: 'branch-off',
+    branchName: 'immutable-cut',
+    beforeAdd: async ({ expectedOid }) => {
+      capturedOid = expectedOid;
+      writeFileSync(join(movingRepo, 'base.txt'), 'two\n');
+      git(movingRepo, 'commit', '-am', 'base moved');
+    },
+  });
+  assert.notEqual(git(movingRepo, 'rev-parse', 'main').trim(), capturedOid);
+  assert.equal(git(task.path, 'rev-parse', 'HEAD').trim(), capturedOid);
+  assert.equal((await readMetadata(task.path)).baseRef, capturedOid);
+  await archiveWorktree(task.path, { force: true });
 });
 
 await test('branch-off slug placeholder + autoName pending', async () => {
@@ -425,7 +630,7 @@ function mockNamerCtx(streamText) {
             assert.ok(options.maxTokens >= 256, `naming budget too small: ${options.maxTokens}`);
             // a string reply is the common case; an explicit chunk array lets a
             // test script the reasoning-only / truncated replies
-            const script = streamText();
+            const script = await streamText();
             if (Array.isArray(script)) {
               for (const chunk of script) yield chunk;
               return;
@@ -555,6 +760,107 @@ await test('autoname: first-message rename end-to-end', async () => {
   reply = 'something-else';
   await namer.attempt(session, 'second message');
   assert.equal(git(wt.path, 'branch', '--show-current').trim(), 'fix-login-bug');
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('autoname: dispose drains an in-flight model without late mutation', async () => {
+  let releaseReply;
+  let markEntered;
+  const entered = new Promise((resolveEntered) => { markEntered = resolveEntered; });
+  const replyGate = new Promise((resolveReply) => { releaseReply = resolveReply; });
+  const ctx = mockNamerCtx(async () => {
+    markEntered();
+    await replyGate;
+    return JSON.stringify({ title: 'Must Not Apply', branch: 'must-not-apply' });
+  });
+  let invalidations = 0;
+  const namer = createAutoNamer(ctx, { invalidate: async () => { invalidations += 1; } });
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dispose-namer' });
+  const placeholder = wt.branch;
+  const running = namer.attempt({ id: 'dispose-session', header: { cwd: wt.path } }, 'rename me');
+  await entered;
+  const draining = namer.dispose();
+  releaseReply();
+  await Promise.all([running, draining]);
+  assert.equal(await currentBranchInfo(wt.path).then((value) => value.branch), placeholder);
+  assert.equal((await readMetadata(wt.path)).branch, placeholder);
+  assert.deepEqual(ctx.titles, []);
+  assert.equal(invalidations, 0);
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('autoname: metadata failure compensates the branch rename', async () => {
+  const ctx = mockNamerCtx(() => JSON.stringify({ title: 'Compensate', branch: 'compensated-name' }));
+  let patchCalls = 0;
+  const namer = createAutoNamer(ctx, null, {
+    patchMetadata: async (...args) => {
+      patchCalls += 1;
+      if (patchCalls === 2) throw new Error('injected auto-name metadata failure');
+      return patchMetadata(...args);
+    },
+  });
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'compensate-namer' });
+  const placeholder = wt.branch;
+  await namer.attempt({ id: 'compensate-session', header: { cwd: wt.path } }, 'rename me');
+  assert.equal((await currentBranchInfo(wt.path)).branch, placeholder);
+  const metadata = await readMetadata(wt.path);
+  assert.equal(metadata.branch, placeholder);
+  assert.equal(metadata.autoName.status, 'attempted');
+  assert.ok(ctx.warnings.some((message) => /branch compensation completed/.test(message)), ctx.warnings.join(' | '));
+  await namer.dispose();
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('autoname: false metadata CAS result also compensates rename', async () => {
+  const ctx = mockNamerCtx(() => JSON.stringify({ title: 'Compensate False', branch: 'false-cas-name' }));
+  let patchCalls = 0;
+  const namer = createAutoNamer(ctx, null, {
+    patchMetadata: async (...args) => {
+      patchCalls += 1;
+      if (patchCalls >= 2) return false;
+      return patchMetadata(...args);
+    },
+  });
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'false-cas-namer' });
+  const placeholder = wt.branch;
+  await namer.attempt({ id: 'false-cas-session', header: { cwd: wt.path } }, 'rename me');
+  assert.equal((await currentBranchInfo(wt.path)).branch, placeholder);
+  const metadata = await readMetadata(wt.path);
+  assert.equal(metadata.branch, placeholder);
+  assert.equal(metadata.autoName.status, 'attempted');
+  await namer.dispose();
+  await archiveWorktree(wt.path, { force: true });
+});
+
+await test('autoname: queued attempt revalidates Workspace capability', async () => {
+  const ctx = mockNamerCtx(() => 'must-not-apply');
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'auth-namer' });
+  const identity = statSync(wt.path);
+  const mainIdentity = statSync(repo);
+  let allowed = true;
+  let markQueued;
+  const queued = new Promise((resolveQueued) => { markQueued = resolveQueued; });
+  const mutations = {
+    run(key, task, options) {
+      markQueued();
+      return hostMutationCoordinator.run(key, task, options);
+    },
+  };
+  const namer = createAutoNamer(ctx, null, {
+    mutations,
+    authorizeTarget: async (cwd) => allowed
+      ? { ok: true, cwd, root: cwd, mainRepoRoot: repo, gitBoundary: 'root', identity: { dev: identity.dev, ino: identity.ino }, mainIdentity: { dev: mainIdentity.dev, ino: mainIdentity.ino } }
+      : { ok: false, reason: 'unauthorized' },
+  });
+  const release = await hostMutationCoordinator.acquire(`git:${repo}`);
+  const attempt = namer.attempt({ id: 'auth-namer-session', header: { cwd: wt.path } }, 'rename me');
+  await queued;
+  allowed = false;
+  release();
+  await attempt;
+  assert.equal((await readMetadata(wt.path)).autoName.status, 'pending');
+  assert.equal((await currentBranchInfo(wt.path)).branch, wt.branch);
+  await namer.dispose();
   await archiveWorktree(wt.path, { force: true });
 });
 
@@ -737,6 +1043,69 @@ await test('hub falls back to immutable base when its branch name disappears', a
     await hub.dispose();
     git(repo, 'branch', '-m', 'relocated-main', 'main');
     await archiveWorktree(orphanedBase.path, { force: true });
+  }
+});
+
+await test('hub dispose fences an in-flight target detection', async () => {
+  const slowBin = join(scratch, 'slow-git-bin');
+  mkdirSync(slowBin);
+  writeFileSync(join(slowBin, 'git'), '#!/bin/sh\nsleep 0.15\nexec /usr/bin/git "$@"\n');
+  chmodSync(join(slowBin, 'git'), 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${slowBin}:${originalPath}`;
+  const emitted = [];
+  const hub = createGitStateHub({ onChange: (snapshot) => emitted.push(snapshot) });
+  try {
+    const computing = hub.snapshotFor(repo);
+    const disposing = hub.dispose();
+    const [snapshot] = await Promise.all([computing, disposing]);
+    assert.equal(snapshot.isGit, false, 'disposed generation must not publish a late target');
+    assert.deepEqual(emitted, []);
+    assert.equal(hub.isKnownGit(repo), false);
+  } finally {
+    process.env.PATH = originalPath;
+    await hub.dispose();
+  }
+});
+
+await test('hub background compute drops a revoked Workspace capability', async () => {
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'hub-auth-revoke' });
+  const identity = statSync(wt.path);
+  const mainIdentity = statSync(repo);
+  let allowed = true;
+  let markRevokedCheck;
+  const revokedCheck = new Promise((resolveCheck) => { markRevokedCheck = resolveCheck; });
+  const emitted = [];
+  const hub = createGitStateHub({
+    onChange: (snapshot) => emitted.push(snapshot),
+    authorizeTarget: async (cwd) => {
+      if (!allowed) {
+        markRevokedCheck();
+        return { ok: false, reason: 'unauthorized' };
+      }
+      return { ok: true, cwd, root: cwd, mainRepoRoot: repo, gitBoundary: 'root', identity: { dev: identity.dev, ino: identity.ino }, mainIdentity: { dev: mainIdentity.dev, ino: mainIdentity.ino } };
+    },
+  });
+  try {
+    const initial = await hub.snapshotFor(wt.path, { fresh: true });
+    assert.equal(initial.isGit, true);
+    const emittedBefore = emitted.length;
+    allowed = false;
+    writeFileSync(join(wt.path, 'revoked-change.txt'), 'must not publish\n');
+    hub.refreshActive();
+    let revokeTimeout;
+    await Promise.race([
+      revokedCheck,
+      new Promise((_, reject) => { revokeTimeout = setTimeout(() => reject(new Error('background compute did not reauthorize')), 3000); }),
+    ]);
+    clearTimeout(revokeTimeout);
+    await new Promise((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(hub.peek(wt.path), null);
+    assert.equal(hub.isKnownGit(wt.path), false);
+    assert.equal(emitted.length, emittedBefore);
+  } finally {
+    await hub.dispose();
+    await archiveWorktree(wt.path, { force: true });
   }
 });
 
@@ -951,7 +1320,7 @@ await test('pr-checkout: same-repo PR head without forged tracking ref', async (
     assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead);
     assert.equal(readFileSync(join(wt.path, 'pr.txt'), 'utf8'), 'from the pr\n');
     // the fetch ref is transaction-scoped and removed after its SHA is read
-    assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/dsh-better-workspaces/pr/12/pr-same-repo'), null);
+    assert.equal(git(prRepo, 'for-each-ref', '--format=%(refname)', 'refs/dsh-better-workspaces/pr/').trim(), '');
     // A missing remote branch stays missing: PR metadata must never
     // manufacture a remote-tracking ref from the fetched PR SHA.
     const seeded = tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/pr-same-repo');
@@ -1029,7 +1398,7 @@ await test('pr-checkout: fork PR → owner-prefixed branch, no upstream', async 
     assert.equal('upstream' in meta, false);
     assert.equal('autoName' in meta, false);
     // the head landed in the PR's own throwaway ref (named after the anchor)
-    assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/dsh-better-workspaces/pr/9/alice/dark-mode'), null);
+    assert.equal(git(prRepo, 'for-each-ref', '--format=%(refname)', 'refs/dsh-better-workspaces/pr/').trim(), '');
     // and nothing was synthesized as the BASE repo's origin/dark-mode
     assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/dark-mode'), null);
   } finally {
@@ -1172,6 +1541,182 @@ await test('api: POST /worktrees with pull → pr-checkout', async () => {
   } finally {
     api.dispose();
     server.close();
+    await hub.dispose();
+  }
+});
+
+await test('api serializes same-repo worktree creation and actions', async () => {
+  const parallelRepo = join(scratch, 'parallel-api-repo');
+  mkdirSync(parallelRepo);
+  git(parallelRepo, 'init', '-b', 'main');
+  git(parallelRepo, 'config', 'user.email', 'test@dsh.local');
+  git(parallelRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(parallelRepo, 'tracked.txt'), 'one\n');
+  git(parallelRepo, 'add', '-A');
+  git(parallelRepo, 'commit', '-m', 'initial');
+  const hub = createGitStateHub({ onChange: () => {} });
+  const registered = [];
+  const deleted = [];
+  let observeMutation = null;
+  let observeRequest = null;
+  const observedMutations = {
+    acquire(key, options) {
+      observeMutation?.(key);
+      return hostMutationCoordinator.acquire(key, options);
+    },
+    run(key, task, options) {
+      observeMutation?.(key);
+      return hostMutationCoordinator.run(key, task, options);
+    },
+  };
+  const api = createApi(hub, {
+    workspaceRoots: () => [parallelRepo, ...registered.map((workspace) => workspace.path)],
+    worktreeWorkspaces: async () => registered,
+    deleteWorkspace: async (workspaceId) => { deleted.push(workspaceId); return true; },
+    mutations: observedMutations,
+    onRequestStart: (sub) => observeRequest?.(sub),
+  });
+  const server = http.createServer((req, res) => api.route.handler(req, res));
+  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+  const endpoint = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
+  const post = (path, body) => fetch(endpoint + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: new URL(endpoint).origin },
+    body: JSON.stringify(body),
+  });
+  const created = [];
+  try {
+    const responses = await Promise.all([0, 1].map(() => post('/worktrees', {
+      cwd: parallelRepo,
+      intent: 'branch-off',
+      branchName: 'parallel-task',
+      slug: 'parallel-task',
+    })));
+    assert.deepEqual(responses.map((response) => response.status), [201, 201]);
+    created.push(...await Promise.all(responses.map((response) => response.json())));
+    assert.equal(new Set(created.map((item) => item.path)).size, 2);
+    assert.equal(new Set(created.map((item) => item.branch)).size, 2);
+    for (const item of created) assert.equal((await validateManagedWorktree(item.path)).ok, true);
+
+    writeFileSync(join(parallelRepo, 'tracked.txt'), 'two\n');
+    const before = Number(git(parallelRepo, 'rev-list', '--count', 'HEAD').trim());
+    const commits = await Promise.all([0, 1].map(() => post('/action', {
+      cwd: parallelRepo,
+      name: 'commit',
+      params: { message: 'parallel commit' },
+    })));
+    assert.deepEqual(commits.map((response) => response.status).sort(), [200, 409]);
+    assert.equal(Number(git(parallelRepo, 'rev-list', '--count', 'HEAD').trim()), before + 1);
+
+    git(created[0].path, 'branch', '-m', 'parallel-task-renamed-manually');
+    registered.push({ workspaceId: 'registered-created-1', path: created[0].path });
+    const repoKey = `git:${parallelRepo}`;
+    const releaseRepo = await hostMutationCoordinator.acquire(repoKey);
+    let markArchiveQueued;
+    const archiveQueued = new Promise((resolveQueued) => { markArchiveQueued = resolveQueued; });
+    observeMutation = (key) => {
+      if (key === repoKey) markArchiveQueued();
+    };
+    const archivedRequest = post('/worktrees/archive', { path: created[0].path, force: true });
+    let archiveTimeout;
+    await Promise.race([
+      archiveQueued,
+      new Promise((_, reject) => { archiveTimeout = setTimeout(() => reject(new Error('archive did not reach mutation gate')), 3000); }),
+    ]);
+    clearTimeout(archiveTimeout);
+    observeMutation = null;
+    assert.equal(existsSync(created[0].path), true);
+    releaseRepo();
+    const archivedResponse = await archivedRequest;
+    assert.equal(archivedResponse.status, 200);
+    const archived = await archivedResponse.json();
+    assert.equal(archived.workspaceDeleted, 'registered-created-1');
+    assert.deepEqual(deleted, ['registered-created-1']);
+
+    const releaseForDispose = await hostMutationCoordinator.acquire(repoKey);
+    let markDisposeQueued;
+    const disposeQueued = new Promise((resolveQueued) => { markDisposeQueued = resolveQueued; });
+    observeMutation = (key) => {
+      if (key === repoKey) markDisposeQueued();
+    };
+    const cancelledArchive = post('/worktrees/archive', { path: created[1].path, force: true });
+    let disposeTimeout;
+    await Promise.race([
+      disposeQueued,
+      new Promise((_, reject) => { disposeTimeout = setTimeout(() => reject(new Error('dispose archive did not reach mutation gate')), 3000); }),
+    ]);
+    clearTimeout(disposeTimeout);
+    observeMutation = null;
+    const largeImage = join(created[1].path, 'paused.png');
+    writeFileSync(largeImage, Buffer.alloc(16 * 1024 * 1024, 1));
+    let pausedResponse;
+    const pausedRaw = new Promise((resolvePaused) => {
+      const request = http.get(`${endpoint}/raw?cwd=${encodeURIComponent(created[1].path)}&path=paused.png`, (response) => {
+        response.pause();
+        pausedResponse = response;
+        resolvePaused();
+      });
+      request.on('error', () => resolvePaused());
+    });
+    await pausedRaw;
+
+    let markSlowTracked;
+    const slowTracked = new Promise((resolveTracked) => { markSlowTracked = resolveTracked; });
+    observeRequest = (sub) => {
+      if (sub === '/snapshots') markSlowTracked();
+    };
+    const slowRequest = http.request(`${endpoint}/snapshots`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: new URL(endpoint).origin,
+        'Content-Length': '1',
+      },
+    });
+    slowRequest.on('error', () => {});
+    slowRequest.flushHeaders();
+    await slowTracked;
+    observeRequest = null;
+    const disposeStarted = Date.now();
+    const disposedApi = api.dispose();
+    const cancelledResponse = await cancelledArchive;
+    await disposedApi;
+    assert.ok(Date.now() - disposeStarted < 1000, 'dispose drains stalled request bodies and raw streams promptly');
+    pausedResponse?.destroy();
+    slowRequest.destroy();
+    releaseForDispose();
+    assert.equal(cancelledResponse.status, 499);
+    assert.equal(existsSync(created[1].path), true, 'dispose cancels a queued destructive mutation');
+
+    const deletionJournal = await prepareWorkspaceDeletion(parallelRepo, created[1].path, 'crash-window-workspace');
+    assert.equal((await archiveWorktree(created[1].path, { force: true })).ok, true);
+    assert.deepEqual(
+      (await pendingWorkspaceDeletions(parallelRepo)).ready.map((entry) => entry.workspaceId),
+      ['crash-window-workspace'],
+    );
+    const { createCleanup } = await import('../lib/cleanup.js');
+    const replayedDeletes = [];
+    const recoveryCleanup = createCleanup({
+      get(name) {
+        if (name === 'sessions') return { list: async () => [] };
+        if (name === 'workspaceRegistry') {
+          return {
+            list: () => [{ workspaceId: 'crash-window-workspace', path: created[1].path }],
+            delete: async (workspaceId) => { replayedDeletes.push(workspaceId); return true; },
+          };
+        }
+        return undefined;
+      },
+    });
+    const replay = await recoveryCleanup({ cwd: parallelRepo, dryRun: false });
+    assert.equal(replay.ok, true, JSON.stringify(replay));
+    assert.deepEqual(replayedDeletes, ['crash-window-workspace']);
+    assert.deepEqual((await pendingWorkspaceDeletions(parallelRepo)).ready, []);
+    await completeWorkspaceDeletion(deletionJournal).catch(() => {});
+  } finally {
+    for (const item of created) await archiveWorktree(item.path, { force: true });
+    await api.dispose();
+    await new Promise((resolveClose) => server.close(resolveClose));
     await hub.dispose();
   }
 });
@@ -1648,6 +2193,72 @@ await test('api: /pulls + /pull over real HTTP (fake gh)', async () => {
   }
 });
 
+await test('cleanup scheduler is single-flight and drains on dispose', async () => {
+  let calls = 0;
+  let release;
+  const gate = new Promise((resolveGate) => { release = resolveGate; });
+  const controller = new AbortController();
+  const scheduler = createCleanupScheduler(async ({ abandoned, signal }) => {
+    calls += 1;
+    assert.equal(abandoned, true);
+    assert.equal(signal, controller.signal);
+    await gate;
+  }, {
+    start: false,
+    signal: controller.signal,
+    onStop: () => controller.abort(),
+  });
+  const first = scheduler.sweep();
+  const second = scheduler.sweep();
+  assert.equal(first, second);
+  assert.equal(calls, 1);
+  let drained = false;
+  const disposing = scheduler.dispose().then(() => { drained = true; });
+  await Promise.resolve();
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(drained, false, 'dispose must await the committed sweep');
+  release();
+  await Promise.all([first, disposing]);
+  assert.equal(calls, 1);
+  assert.equal(scheduler.sweep(), null);
+});
+
+await test('cleanup revalidates its queued repository capability', async () => {
+  const identity = statSync(repo);
+  const capability = { ok: true, cwd: repo, root: repo, mainRepoRoot: repo, identity: { dev: identity.dev, ino: identity.ino } };
+  let allowed = true;
+  let markQueued;
+  const queued = new Promise((resolveQueued) => { markQueued = resolveQueued; });
+  const observed = {
+    run(key, task, options) {
+      markQueued();
+      return hostMutationCoordinator.run(key, task, options);
+    },
+    acquire: (...args) => hostMutationCoordinator.acquire(...args),
+  };
+  const { createCleanup } = await import('../lib/cleanup.js');
+  const cleanup = createCleanup({
+    get(name) {
+      if (name === 'sessions') return { list: async () => [] };
+      if (name === 'workspaceRegistry') return { list: () => [], delete: async () => true };
+      return undefined;
+    },
+  }, { mutations: observed });
+  const release = await hostMutationCoordinator.acquire(`git:${repo}`);
+  const running = cleanup({
+    cwd: repo,
+    capability,
+    reauthorize: async () => allowed ? capability : { ok: false, reason: 'unauthorized' },
+  });
+  await queued;
+  allowed = false;
+  release();
+  const report = await running;
+  assert.equal(report.ok, false);
+  assert.match(report.error, /capability changed/);
+  assert.equal(existsSync(wt1.path), true);
+});
+
 await test('cleanup sweep: dry-run, guards, archive + workspace delete', async () => {
   const { createCleanup } = await import('../lib/cleanup.js');
   const deleted = [];
@@ -1758,7 +2369,7 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   await archiveWorktree(wtUnknown.path, { force: true });
 });
 
-await test('cleanup abandoned sweep: blank+old only', async () => {
+await test('cleanup abandoned sweep: unreferenced+old only', async () => {
   const { createCleanup } = await import('../lib/cleanup.js');
   const { patchMetadata } = await import('../lib/worktree.js');
   const deleted = [];
@@ -1797,7 +2408,6 @@ await test('cleanup abandoned sweep: blank+old only', async () => {
   const aged = Date.now() - 3600000;
   for (const target of [wtOld.path, wtBusy.path]) await patchMetadata(target, (m) => ({ ...m, createdAt: aged }));
   const byId = {
-    s1: { header: { cwd: wtOld.path }, blank: true },
     s2: { header: { cwd: wtFresh.path }, blank: true },
     s3: { header: { cwd: wtBusy.path }, blank: false },
   };

@@ -21,7 +21,7 @@ _Avoid_: cwd 校验、路径白名单
 _Avoid_: 首页、欢迎页
 
 **择基创建（create-on-arm）**：
-暂存态下选定基分支、选定 PR 行（见 PR 检出）、确认显式分支名、或点「立即创建」即创建 worktree 与工作区并跳转新会话——会话诞生于 worktree 内，首轮工具即落在新目录（会话 cwd 创建后不可迁移，见 ADR 0004 Amendment 2）。打开菜单与浏览分支零副作用；被遗弃的产物由 abandoned 清扫回收。
+暂存态下选定基分支、选定 PR 行（见 PR 检出）、确认显式分支名、或点「立即创建」即创建 worktree 与工作区并跳转新会话——会话诞生于 worktree 内，首轮工具即落在新目录（会话 cwd 创建后不可迁移，见 ADR 0004 Amendment 2）。打开菜单与浏览分支零副作用；被遗弃的产物可由显式 abandoned 清理回收。定时任务在宿主尚无 Session lease 时只做崩溃事务恢复，不自动归档。
 _Avoid_: 首送创建、点击即创建
 
 **本地检出（「本地」）**：
@@ -32,8 +32,20 @@ _Avoid_: 主目录、原目录
 由本插件在对应来源仓库的专属 worktrees 根下创建、元数据与 Git worktree 清单都能证明其归属的链接工作树；只有托管 worktree 允许从界面归档（Archive）。单有目录名或元数据文件不构成托管身份。
 _Avoid_: 临时目录、副本
 
+**仓库族变更门（repo-family mutation gate）**：
+同一主仓库及其全部 linked worktree 共享的宿主 FIFO 变更序列，键为授权阶段固定的规范主仓库根。create、archive、action、后台 fetch、自动改名和 Git 工作区文件保存都经此门；锁内同时复验目标根与主仓库根的设备号/inode，并在 Linux 上以 dirfd 锚定跨多条命令的目标，固定顺序是仓库门→文件 mutex。不同仓库仍可并行，Agent 或用户在插件外直接运行 Git 不受此门约束。
+_Avoid_: 全局锁、worktree 锁
+
+**创建事务日志（create journal）**：
+仓库专属受管根先以 fsync owner record 绑定 main repo dev/inode；`git worktree add` 前再写入 fsync pending，包含 txId、路径、分支和不可变创建 OID。prepared 阶段不声称拥有未来分支；仅在 Git row/branch/HEAD 与 path/gitdir inode 全部证明后升级 added。元数据提交成功后清除；进程若在中间退出，自动恢复绝不删除仍存在的 path 或 row（普通 status 看不见 ignored/事后文件），只在两者都已由人工移除后按 OID CAS 删除本次拥有的分支；证据不足宁可保留，也会清扫插件专属 PR 临时 ref。
+_Avoid_: worktree 元数据、操作日志
+
+**注册表删除墓碑（registry deletion tombstone）**：
+归档在删除 Git/path 之前 fsync 的按 Workspace ID 收敛记录。Git worktree row 与路径都消失后，仍在同一仓库族变更门内执行 `workspaceRegistry.delete(id)`；跨服务窗口崩溃或删除失败会保留墓碑供启动/定时恢复，绝不按可复用路径重新查询目标。
+_Avoid_: 路径清理队列、warning-only 删除
+
 **活动会话守卫**：
-清理把 cwd 等于托管 worktree 根或位于其任意子目录的会话都视为占用；破坏性归档前必须重新读取一次会话快照。普通清理遇到任何活动会话都跳过，abandoned 清理则至少在会话已非空时跳过；会话源不可读时失败关闭。
+清理把 cwd 等于托管 worktree 根或位于其任意子目录的会话都视为占用；破坏性归档前必须重新读取一次会话快照。普通与 abandoned 清理遇到任何活动会话（包括空白会话）都跳过；会话源不可读时失败关闭。宿主目前没有会话租约，因此它不能消除「最后快照之后刚创建会话」的外部竞态，只选择最保守的快照语义。
 _Avoid_: 仅根目录会话、启动时快照
 
 **基线（base）**：
@@ -171,7 +183,7 @@ diff 视图主操作按状态晋升的顺序：Commit（脏时）→ Pull（落�
 _Avoid_: 按钮组
 
 **Merge-to-base / Update-from-base**：
-把当前分支合入基线分支（基线被其他 worktree 检出时在其 worktree 内执行）/ 把最超前的基线合入当前分支（要求干净工作树）。
+把当前分支合入基线分支（基线被其他 worktree 检出时在其 worktree 内执行）/ 把最超前的基线合入当前分支（要求干净工作树）。合并前把来源解析成完整 OID；冲突后一律保留 MERGE_HEAD 与工作树并返回 partial recovery，由用户显式解决或 abort，避免插件撤销已经被外部用户/Agent 接管的冲突现场。
 
 ## 安装与挂载
 

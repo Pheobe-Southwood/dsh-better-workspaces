@@ -26,6 +26,7 @@ const { API_PREFIX, createApi } = await import('../lib/api.js');
 const { createWorkspaceAuthorizer } = await import('../lib/authorize.js');
 const { archiveWorktree, createWorktree, metadataPathFor, repoWorktreesRoot, validateManagedWorktree } = await import('../lib/worktree.js');
 const { createGitStateHub } = await import('../lib/state.js');
+const { hostMutationCoordinator } = await import('../lib/mutation.js');
 
 function git(cwd, ...args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -68,7 +69,23 @@ const hub = {
   },
 };
 const cleanup = async () => ({ ok: true, archived: [], skipped: [], errors: [] });
-const api = createApi(hub, { workspaceRoots: () => roots, cleanup, worktreeWorkspaces: async () => [] });
+let observeMutation = null;
+const observedMutations = {
+  acquire(key, options) {
+    observeMutation?.(key);
+    return hostMutationCoordinator.acquire(key, options);
+  },
+  run(key, task, options) {
+    observeMutation?.(key);
+    return hostMutationCoordinator.run(key, task, options);
+  },
+};
+const api = createApi(hub, {
+  workspaceRoots: () => roots,
+  cleanup,
+  worktreeWorkspaces: async () => [],
+  mutations: observedMutations,
+});
 const server = http.createServer((req, res) => api.route.handler(req, res));
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const origin = `http://127.0.0.1:${server.address().port}`;
@@ -174,6 +191,9 @@ try {
   assert.equal((await request(`/file?cwd=${encodeURIComponent(repo)}&path=${encodeURIComponent('.git/config')}`)).status, 403);
   assert.equal((await request('/file', jsonInit({ cwd: repo, path: '.git/config', content: 'hostile\n', baseSha1: createHash('sha1').update(gitConfigBefore).digest('hex') }))).status, 403);
   assert.equal(readFileSync(join(repo, '.git', 'config'), 'utf8'), gitConfigBefore);
+  symlinkSync('.git/config', join(repo, 'git-config-alias'));
+  assert.equal((await request(`/file?cwd=${encodeURIComponent(repo)}&path=git-config-alias`)).status, 403);
+  assert.equal((await request(`/raw?cwd=${encodeURIComponent(repo)}&path=git-config-alias`)).status, 403);
 
   // Atomic replacement must break an in-workspace hard-link alias instead of
   // mutating the same inode outside the authorized root, and preserve mode.
@@ -409,6 +429,68 @@ try {
   const symlinkManaged = await validateManagedWorktree(attackerWorktree, { expectedMainRoot: symlinkSource });
   assert.equal(symlinkManaged.ok, false);
   assert.equal(symlinkManaged.reason, 'managed-root-rebound');
+
+  // File-only authority for a registered Git subdirectory still shares the
+  // containing repository's mutation gate (without gaining Git action rights).
+  const nestedFile = join(nested, 'nested-gated.txt');
+  writeFileSync(nestedFile, 'before\n');
+  const nestedSha1 = createHash('sha1').update(readFileSync(nestedFile)).digest('hex');
+  const gitFamilyKey = `git:${repo}`;
+  const releaseGitFamily = await hostMutationCoordinator.acquire(gitFamilyKey);
+  let markNestedQueued;
+  const nestedQueued = new Promise((resolveQueued) => { markNestedQueued = resolveQueued; });
+  observeMutation = (key) => {
+    if (key === gitFamilyKey) markNestedQueued();
+  };
+  const nestedSave = request('/file', jsonInit({ cwd: nested, path: 'nested-gated.txt', content: 'after\n', baseSha1: nestedSha1 }));
+  let nestedTimeout;
+  await Promise.race([
+    nestedQueued,
+    new Promise((_, reject) => { nestedTimeout = setTimeout(() => reject(new Error('nested file did not reach Git family gate')), 3000); }),
+  ]);
+  clearTimeout(nestedTimeout);
+  observeMutation = null;
+  assert.equal(readFileSync(nestedFile, 'utf8'), 'before\n');
+  releaseGitFamily();
+  assert.equal((await nestedSave).status, 200);
+  assert.equal(readFileSync(nestedFile, 'utf8'), 'after\n');
+
+  // Authorization is captured before queueing, then re-proven after the outer
+  // workspace gate. Reusing the same lexical root with a new inode must not let
+  // an old queued file save mutate the replacement workspace.
+  const staleFile = join(plain, 'stale.txt');
+  writeFileSync(staleFile, 'old workspace\n');
+  const baseSha1 = createHash('sha1').update(readFileSync(staleFile)).digest('hex');
+  const mutationKey = `workspace:${plain}`;
+  const releaseOwner = await hostMutationCoordinator.acquire(mutationKey);
+  let markQueued;
+  const reachedGate = new Promise((resolveQueued) => { markQueued = resolveQueued; });
+  observeMutation = (key) => {
+    if (key === mutationKey) markQueued();
+  };
+  const queuedSave = request('/file', jsonInit({
+    cwd: plain,
+    path: 'stale.txt',
+    content: 'queued overwrite\n',
+    baseSha1,
+  }));
+  let gateTimeout;
+  await Promise.race([
+    reachedGate,
+    new Promise((_, reject) => { gateTimeout = setTimeout(() => reject(new Error('file mutation did not reach gate')), 3000); }),
+  ]);
+  clearTimeout(gateTimeout);
+  observeMutation = null;
+  const oldPlain = `${plain}-old-inode`;
+  renameSync(plain, oldPlain);
+  mkdirSync(plain);
+  writeFileSync(join(plain, 'stale.txt'), 'replacement workspace\n');
+  releaseOwner();
+  const staleResponse = await queuedSave;
+  assert.equal(staleResponse.status, 409, staleResponse.text);
+  assert.equal(readFileSync(join(plain, 'stale.txt'), 'utf8'), 'replacement workspace\n');
+  rmSync(plain, { recursive: true, force: true });
+  renameSync(oldPlain, plain);
 
   console.log('SECURITY: ALL PASS');
 } finally {
