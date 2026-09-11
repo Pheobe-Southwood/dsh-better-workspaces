@@ -210,7 +210,11 @@ assert.equal(forgeSource.trigger, '@');
 assert.equal(forgeSource.name, 'better-workspaces-forge');
 assert.equal(typeof forgeSource.codec, 'object', 'a codec is what turns a chip into model text');
 assert.equal(typeof forgeSource.codec.serialize, 'function');
-assert.equal(forgeSource.codec.clipboardText('7'), '@7');
+/* The projection the user SEES is "#N", while `trigger` above stays "@" (the
+   official TriggerChar union is '/' | '@', and `trigger` is the lexicon's key
+   domain). Keeping them different is the fix: an "@N" chip woke the official
+   attachment/reference menu on the same keystroke. */
+assert.equal(forgeSource.codec.clipboardText('7'), '#7');
 /* NOT `candidates === undefined`: the controller's roster loop calls
    `candidates(...)` synchronously on every `@` hit, so an omitted hook throws
    inside the loop and every source ordered after this one stops answering.
@@ -226,7 +230,7 @@ for (const source of triggerSources) {
   assert.equal(typeof pending.then, 'function', `${source.name}: candidates must return a promise`);
   assert.ok(Array.isArray(await pending), `${source.name}: candidates must resolve to a list`);
 }
-assert.equal(typeof forgeSource.lexicon, 'function', 'the lexicon decorates a persisted @N draft');
+assert.equal(typeof forgeSource.lexicon, 'function', 'the lexicon decorates a persisted #N-shaped draft');
 assert.ok(Array.isArray(forgeSource.lexicon()), 'lexicon answers a roll, never undefined');
 /* A roll that never changes after warm would leave a freshly attached ref
    undecorated, so the source must publish its invalidation channel too. */
@@ -398,7 +402,7 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
       'the span carries the shell’s live rev (a stale render-time rev would fail the CAS)');
     assert.equal(ref.source, 'better-workspaces-forge', 'the reference names our trigger source');
     assert.equal(ref.ref, '7', 'and carries the picked number');
-    assert.equal(ref.clipboardText, '@7', 'with the clipboard form the decoration scans');
+    assert.equal(ref.clipboardText, '#7', 'the chip shows "#7" so it cannot wake the "@" menu');
     assert.ok(ref.label.includes('#7'), `the chip label names the item: ${ref.label}`);
     return true;
   };
@@ -413,14 +417,34 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
   assert.equal(usedFallback, false, 'the chip path never needs the plain-text degradation');
   assert.equal(notified, null, 'and a successful attach stays quiet');
 
-  // (c) degradation: a refused chip still leaves the token in the draft
+  // (c) degradation: a refused chip writes the MODEL FORM as plain text.
+  // A bare "#N" token would NOT work: the send path walks
+  // `projection.occurrences`, which only real chip nodes produce, and passes
+  // the draft through untouched when there are none — so a token-only fallback
+  // would deliver "#N" to the model with no title, no link and no body.
   sessionInput.insertReference = () => false;
-  usedFallback = false;
+  let writtenDraft = null;
+  sessionInput.setDraft = (next) => { usedFallback = true; writtenDraft = next; };
+  /* A richer item than the one above: the fields a bare token would DROP are
+     exactly the ones this case must demand, so reverting to the token-only
+     fallback fails here instead of silently degrading the model's context. */
+  const richItem = {
+    number: 7, kind: 'change_request', title: 'wire up the picker',
+    url: 'https://example.invalid/pull/7',
+    baseRefName: 'main', headRefName: 'feat/picker',
+    body: 'the body the model needs',
+  };
   mod.__bwTest.attachForgeReference({
-    item, sessionInput,
+    item: richItem, sessionInput,
     fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
   });
   assert.equal(usedFallback, true, 'a refused chip degrades to a plain-text append');
+  assert.match(writtenDraft, /^hello /, 'the degraded text appends at the draft end');
+  for (const part of ['wire up the picker', 'https://example.invalid/pull/7',
+    'Base: main', 'Head: feat/picker', 'the body the model needs']) {
+    assert.ok(writtenDraft.includes(part),
+      `the degraded text carries the model form (missing: ${part}): ${writtenDraft}`);
+  }
 
   // (d) both roads closed: the failure must reach the composer, not vanish.
   // `insertReference` answers false instead of throwing and `setDraft` returns
@@ -486,6 +510,31 @@ assert.match(
   codeOnly,
   /\.get\(\s*["']conversation["']\s*\)/,
   'and it actually asks for that service',
+);
+
+/* The chip's VISIBLE marker is "#N", never "@N". "@" is the wake-up char for
+   the official attachment/reference sources, so an "@N" projection put both
+   menus on the same keystroke. This is a static guard on purpose: the display
+   form is produced in two places (the insert payload and the codec projection)
+   and a behavioural test only covers whichever one it happens to exercise. */
+assert.match(
+  codeOnly,
+  /clipboardText:\s*["']#["']/,
+  'the chip payload projects as "#N"',
+);
+assert.match(
+  codeOnly,
+  /clipboardText:\s*\(ref\)\s*=>\s*["']#["']/,
+  'and so does the codec projection',
+);
+assert.ok(
+  !/clipboardText:\s*["']@["']/.test(codeOnly),
+  'no reference projection may start with "@" again',
+);
+assert.match(
+  codeOnly,
+  /trigger:\s*["']@["']/,
+  'while `trigger` stays "@" (the official TriggerChar union is only "/" | "@")',
 );
 
 /* ---------------- diff as an official right-Sidebar page type ---------------- */
