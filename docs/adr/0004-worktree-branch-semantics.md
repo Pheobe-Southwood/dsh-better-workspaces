@@ -228,8 +228,8 @@ Adopted in full:
   are exact refs. `createWorktree` verifies `refs/...` bases as-is; bare
   names keep the origin-first fallback (old-client compatibility).
 - Beyond paseo: creation additionally gives `git fetch origin --prune` a
-  bounded 4 s head start when a remote exists (120 s cap, allowFail, race —
-  never blocks or fails creation), so the default base is the remote head
+  bounded 4 s head start when a remote exists (120 s command cap, raced as a
+  best-effort refresh; a failed fetch is recorded as failed but never blocks creation), so the default base is the remote head
   as of *now*, not as of the last background cycle.
 
 `git fetch` cannot cause merge conflicts by construction: it only downloads
