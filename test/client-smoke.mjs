@@ -375,7 +375,34 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
   ctx.get = (name) => (name === 'conversation' ? conversation : originalGet ? originalGet(name) : undefined);
 
   const item = { number: 7, kind: 'change_request', title: 'wire up the picker', state: 'OPEN' };
-  // (a) a binding is NOT a session scope: it must resolve to null, not throw
+  const detectEnd = mod.__bwTest.referenceDetectEnd;
+
+  // (a) the projection contract: occurrence ranges are CLIPBOARD coordinates,
+  // while every real chip contributes exactly one U+FFFC to detect text.
+  assert.equal(detectEnd({ draft: '', occurrences: [] }), 0, 'an empty composer ends at zero');
+  assert.equal(detectEnd({
+    draft: '#803 ',
+    occurrences: [{ offset: 0, length: 4 }],
+  }), 2, 'one chip plus its trailing space occupies two detect characters');
+  assert.equal(detectEnd({
+    draft: '#803 #777 ',
+    occurrences: [{ offset: 0, length: 4 }, { offset: 5, length: 4 }],
+  }), 4, 'two chips produce detect end 4 — the third-pick regression boundary');
+  assert.equal(detectEnd({
+    draft: 'pre #7\n#1200 tail',
+    occurrences: [
+      { offset: 4, length: 2 },
+      { offset: 7, length: 5, invalid: true },
+    ],
+  }), 12, 'plain text, newlines, variable-width and invalid chips preserve exact conversion');
+  for (const malformed of [
+    { draft: '#7', occurrences: [{ offset: 0, length: 0 }] },
+    { draft: '#7', occurrences: [{ offset: 0, length: 3 }] },
+    { draft: '#7#8', occurrences: [{ offset: 0, length: 2 }, { offset: 1, length: 2 }] },
+    { draft: '#7', occurrences: [{ offset: 0.5, length: 2 }] },
+  ]) assert.equal(detectEnd(malformed), null, 'malformed projections never manufacture a span');
+
+  // (b) a binding is NOT a session scope: it must resolve to null, not throw.
   assert.equal(
     mod.__bwTest.resolveForgeSessionInput({ scope: (id) => ({ [SESSION_SCOPE]: id }) }, 's-1'),
     sessionInput,
@@ -387,15 +414,70 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     'and degrades to null when the session has no scope',
   );
 
-  // (b) the chip path: the shell's own caretSpan is the insertion point, and the
-  // revision comes from the SHELL, not the component's render-time snapshot
+  // (c) exact regression: three consecutive picks update a live shell. Before
+  // this fix the first two succeeded by accident; the third used clipboard end
+  // 10 as a detect span against a document whose real end was 4, was refused,
+  // then expanded into model-form plain text.
+  let multiState = { draft: '', draftRev: 0, phase: 'plain', occurrences: [] };
+  const multiSpans = [];
+  let multiSetDraftCalls = 0;
+  let multiNotices = 0;
+  const multiShell = {
+    rev: 0,
+    get snapshot() { return multiState; },
+    caretSpan() {
+      const at = detectEnd(multiState);
+      return { start: at, end: at };
+    },
+    insertReference(ref, span) {
+      const at = detectEnd(multiState);
+      multiSpans.push({ ...span });
+      if (span.start !== at || span.end !== at || span.draftRev !== this.rev) return false;
+      const offset = multiState.draft.length;
+      this.rev += 1;
+      multiState = {
+        draft: multiState.draft + ref.clipboardText + ' ',
+        draftRev: this.rev,
+        phase: 'plain',
+        occurrences: multiState.occurrences.concat({
+          occurrenceId: this.rev,
+          source: ref.source,
+          ref: ref.ref,
+          offset,
+          length: ref.clipboardText.length,
+          label: ref.label,
+          clipboardText: ref.clipboardText,
+        }),
+      };
+      return true;
+    },
+    setDraft() { multiSetDraftCalls += 1; },
+    notify() { multiNotices += 1; },
+  };
+  const three = [803, 777, 42].map((number) => mod.__bwTest.attachForgeReference({
+    item: { number, kind: 'issue', title: `issue ${number}` },
+    sessionInput: multiShell,
+    fallbackInput: null,
+  }));
+  assert.deepEqual(three, [true, true, true], 'all three picks land as real chips');
+  assert.deepEqual(multiSpans, [
+    { start: 0, end: 0, draftRev: 0 },
+    { start: 2, end: 2, draftRev: 1 },
+    { start: 4, end: 4, draftRev: 2 },
+  ], 'each pick uses the exact live detect end, including the third');
+  assert.equal(multiState.draft, '#803 #777 #42 ', 'all three stay in chip-shaped clipboard form');
+  assert.equal(multiState.occurrences.length, 3, 'all three are real chip occurrences');
+  assert.equal(multiSetDraftCalls, 0, 'the attach path never expands the draft through setDraft');
+  assert.equal(multiNotices, 0, 'successful inserts stay quiet');
+
+  // (d) one ordinary successful chip: live rev wins over render-time state.
   sessionInput.rev = 9;
-  sessionInput.caretSpan = () => ({ start: 5, end: 5, draftRev: 3 });
-  sessionInput.snapshot = { draft: 'hello' };
-  let usedFallback = false;
+  sessionInput.caretSpan = () => ({ start: 5, end: 5 });
+  sessionInput.snapshot = { draft: 'hello', draftRev: 9, phase: 'plain', occurrences: [] };
+  let setDraftCalls = 0;
   let notified = null;
   sessionInput.notify = (level, text) => { notified = { level, text }; };
-  sessionInput.setDraft = () => { usedFallback = true; };
+  sessionInput.setDraft = () => { setDraftCalls += 1; };
   sessionInput.insertReference = (ref, span) => {
     assert.equal(resolvedWith, 's-1', 'the reference resolves before insertion');
     assert.deepEqual(span, { start: 5, end: 5, draftRev: 9 },
@@ -406,86 +488,73 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     assert.ok(ref.label.includes('#7'), `the chip label names the item: ${ref.label}`);
     return true;
   };
-  assert.equal(
-    mod.__bwTest.attachForgeReference({
-      item, sessionInput,
-      fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
-    }),
-    true,
-    'the picked row lands a reference chip',
-  );
-  assert.equal(usedFallback, false, 'the chip path never needs the plain-text degradation');
+  assert.equal(mod.__bwTest.attachForgeReference({
+    item, sessionInput, fallbackInput: { draft: 'stale', draftRev: 0, occurrences: [] },
+  }), true, 'the picked row lands a reference chip');
+  assert.equal(setDraftCalls, 0, 'the atomic chip path never mutates the draft as plain text');
   assert.equal(notified, null, 'and a successful attach stays quiet');
 
-  // (c) degradation: a refused chip writes the MODEL FORM as plain text.
-  // A bare "#N" token would NOT work: the send path walks
-  // `projection.occurrences`, which only real chip nodes produce, and passes
-  // the draft through untouched when there are none — so a token-only fallback
-  // would deliver "#N" to the model with no title, no link and no body.
+  // (e) a refused chip is atomic: draft unchanged, no setDraft, visible notice.
   sessionInput.insertReference = () => false;
-  let writtenDraft = null;
-  sessionInput.setDraft = (next) => { usedFallback = true; writtenDraft = next; };
-  /* A richer item than the one above: the fields a bare token would DROP are
-     exactly the ones this case must demand, so reverting to the token-only
-     fallback fails here instead of silently degrading the model's context. */
-  const richItem = {
-    number: 7, kind: 'change_request', title: 'wire up the picker',
-    url: 'https://example.invalid/pull/7',
-    baseRefName: 'main', headRefName: 'feat/picker',
-    body: 'the body the model needs',
-  };
-  mod.__bwTest.attachForgeReference({
-    item: richItem, sessionInput,
-    fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
-  });
-  assert.equal(usedFallback, true, 'a refused chip degrades to a plain-text append');
-  assert.match(writtenDraft, /^hello /, 'the degraded text appends at the draft end');
-  for (const part of ['wire up the picker', 'https://example.invalid/pull/7',
-    'Base: main', 'Head: feat/picker', 'the body the model needs']) {
-    assert.ok(writtenDraft.includes(part),
-      `the degraded text carries the model form (missing: ${part}): ${writtenDraft}`);
-  }
-
-  // (d) both roads closed: the failure must reach the composer, not vanish.
-  // `insertReference` answers false instead of throwing and `setDraft` returns
-  // without a write when the draft is unchanged, so an unreported failure is
-  // indistinguishable from "the click did nothing".
-  sessionInput.insertReference = () => false;
-  sessionInput.setDraft = () => { throw new Error('composer locked'); };
   notified = null;
-  assert.equal(
-    mod.__bwTest.attachForgeReference({
-      item, sessionInput,
-      fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
-    }),
-    false,
-    'a fully refused attach reports failure',
-  );
-  assert.ok(notified, 'and surfaces it on the composer notice channel');
+  assert.equal(mod.__bwTest.attachForgeReference({ item, sessionInput, fallbackInput: null }), false,
+    'a refused attach reports failure');
+  assert.equal(setDraftCalls, 0, 'a refused chip never expands into plain text');
+  assert.ok(notified, 'the refusal surfaces on the composer notice channel');
   assert.equal(notified.level, 'error', 'as an error notice');
   assert.ok(notified.text.startsWith(dictionaries.dicts.zh['forge.attachFailed'].split('{reason}')[0]),
     `with the localized template: ${notified.text}`);
-  assert.match(notified.text, /composer locked/, 'carrying the underlying reason');
+  assert.ok(notified.text.includes(dictionaries.dicts.zh['forge.attachFailedRejected']),
+    `and the retryable rejection reason: ${notified.text}`);
 
-  // (e) no shell at all (resolution failed): same duty, using the no-target copy
+  // (f) an exception carries its underlying reason and is still atomic.
+  sessionInput.insertReference = () => { throw new Error('composer locked'); };
   notified = null;
-  mod.__bwTest.attachForgeReference({
-    item, sessionInput: null,
-    fallbackSpan: { start: 0, end: 0, draftRev: 0 }, fallbackDraft: '',
-  });
-  assert.equal(notified, null, 'with no shell there is no channel to report on');
+  assert.equal(mod.__bwTest.attachForgeReference({ item, sessionInput, fallbackInput: null }), false,
+    'a thrown attach reports failure');
+  assert.equal(setDraftCalls, 0, 'an exception never writes model-form text either');
+  assert.match(notified.text, /composer locked/, 'the notice carries the underlying reason');
 
-  // (f) a caret parked mid-text must not be split by a dialog-driven pick
-  sessionInput.setDraft = () => { usedFallback = true; };
+  // (g) malformed live projection: do not even call insertReference.
+  let insertCalls = 0;
+  sessionInput.rev = 10;
+  sessionInput.snapshot = {
+    draft: '#7', draftRev: 10, phase: 'plain',
+    occurrences: [{ offset: 0, length: 0 }],
+  };
+  sessionInput.insertReference = () => { insertCalls += 1; return true; };
+  notified = null;
+  assert.equal(mod.__bwTest.attachForgeReference({ item, sessionInput, fallbackInput: null }), false,
+    'an inconsistent projection is rejected');
+  assert.equal(insertCalls, 0, 'no guessed span reaches the editor');
+  assert.equal(setDraftCalls, 0, 'and the malformed state leaves the draft untouched');
+  assert.ok(notified, 'the malformed projection is visible to the user');
+
+  // (h) no shell at all: return false; the caller keeps the picker open.
+  assert.equal(mod.__bwTest.attachForgeReference({
+    item, sessionInput: null,
+    fallbackInput: { draft: '', draftRev: 0, phase: 'plain', occurrences: [] },
+  }), false, 'a missing shell cannot claim success');
+
+  // (i) a caret parked mid-text must not split the draft: append at exact end.
+  sessionInput.rev = 11;
+  sessionInput.snapshot = { draft: 'hello', draftRev: 11, phase: 'plain', occurrences: [] };
+  sessionInput.caretSpan = () => ({ start: 2, end: 2 });
   let chipSpan = null;
-  sessionInput.caretSpan = () => ({ start: 2, end: 2, draftRev: 3 });
   sessionInput.insertReference = (ref, span) => { chipSpan = span; return true; };
-  mod.__bwTest.attachForgeReference({
-    item, sessionInput,
-    fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
-  });
-  assert.deepEqual(chipSpan, { start: 5, end: 5, draftRev: 9 },
-    'an off-end caret falls back to the draft end instead of splitting the text');
+  assert.equal(mod.__bwTest.attachForgeReference({ item, sessionInput, fallbackInput: null }), true,
+    'a mid-text caret still permits an append');
+  assert.deepEqual(chipSpan, { start: 5, end: 5, draftRev: 11 },
+    'a mid-text caret falls back to the exact draft end instead of splitting text');
+
+  // (j) a caret beyond the computed end is invalid too. The old `>=` test
+  // accepted it as "at end" and handed an out-of-range span to the editor.
+  sessionInput.caretSpan = () => ({ start: 6, end: 6 });
+  chipSpan = null;
+  assert.equal(mod.__bwTest.attachForgeReference({ item, sessionInput, fallbackInput: null }), true,
+    'an over-end caret is normalized rather than refused');
+  assert.deepEqual(chipSpan, { start: 5, end: 5, draftRev: 11 },
+    'an over-end caret must also fall back to the exact detect end');
 }
 
 /* The resolver's shape is a contract, not an implementation detail: a session
@@ -535,6 +604,27 @@ assert.match(
   codeOnly,
   /trigger:\s*["']@["']/,
   'while `trigger` stays "@" (the official TriggerChar union is only "/" | "@")',
+);
+
+/* Reference insertion is atomic: a refusal keeps the picker open and never
+   mutates the draft into the model form. The direct cases above prove the
+   attach function; these source-shape guards cover the control's close policy
+   and prevent the old coordinate formula from being reintroduced elsewhere. */
+assert.match(
+  codeOnly,
+  /if\s*\(landed\)\s*setOpen\(false\)/,
+  'the picker closes only after a chip actually lands',
+);
+assert.ok(
+  !/offset\s*\+\s*Math\.max\(draft\.length\s*-\s*label/.test(codeOnly),
+  'the old clipboard/detect-mixing draft-end formula is gone',
+);
+const attachStart = codeOnly.indexOf('function attachForgeReference');
+const attachEnd = codeOnly.indexOf('function renderForgeReferenceText', attachStart);
+assert.ok(attachStart >= 0 && attachEnd > attachStart, 'the attach function is isolatable for source guards');
+assert.ok(
+  !/\.setDraft\s*\(/.test(codeOnly.slice(attachStart, attachEnd)),
+  'the attach function has no plain-text draft fallback',
 );
 
 /* ---------------- diff as an official right-Sidebar page type ---------------- */
