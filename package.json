@@ -41,6 +41,6 @@
     "docs"
   ],
   "scripts": {
-    "test": "node test/run.js && node test/client-smoke.mjs && node test/mount-check.mjs"
+    "test": "node test/run.js && node test/security.mjs && node test/client-smoke.mjs && node test/mount-check.mjs"
   }
 }

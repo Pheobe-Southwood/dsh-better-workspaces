@@ -15,10 +15,10 @@ process.env.DSH_HOME = join(scratch, 'dshhome');
 mkdirSync(process.env.DSH_HOME, { recursive: true });
 
 const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind, runGit, listCommits, unpushedShas } = await import('../lib/git.js');
-const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, worktreesRoot } = await import('../lib/worktree.js');
+const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, repoWorktreesRoot, worktreesRoot } = await import('../lib/worktree.js');
 const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
-const { commitAction, pullAction, discardAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
+const { commitAction, pullAction, pushAction, discardAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
 const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable } = await import('../lib/forge.js');
@@ -89,6 +89,21 @@ await test('runGit accepted exits never hide process failures', async () => {
   const timedOut = await runGit(['-c', 'alias.wait=!sleep 1', 'wait'], { cwd: repo, timeout: 20, acceptedExitCodes: [0, 1] });
   assert.equal(timedOut.ok, false, 'killed/time-limited processes always fail');
   assert.equal(timedOut.timedOut, true);
+});
+
+await test('read-only Git ignores repository fsmonitor executables', async () => {
+  const marker = join(scratch, 'fsmonitor-ran');
+  const payload = join(scratch, 'fsmonitor-payload');
+  writeFileSync(payload, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 0\n`);
+  chmodSync(payload, 0o755);
+  git(repo, 'config', 'core.fsmonitor', payload);
+  try {
+    const status = await porcelainStatus(repo);
+    assert.equal(status.ok, true, JSON.stringify(status));
+    assert.equal(existsSync(marker), false);
+  } finally {
+    git(repo, 'config', '--unset', 'core.fsmonitor');
+  }
 });
 
 await test('git observation failures are explicit unknowns', async () => {
@@ -214,7 +229,7 @@ await test('discard handles a true unborn repository without a fake reset failur
   assert.equal(existsSync(join(unborn, 'only-untracked.txt')), false, 'unborn discard cleans untracked files');
 });
 
-await test('commit hook rejection reaches commitAction', async () => {
+await test('host commit ignores repository hooks', async () => {
   const hooked = join(scratch, 'hooked-commit');
   mkdirSync(hooked);
   git(hooked, 'init', '-b', 'main');
@@ -224,15 +239,61 @@ await test('commit hook rejection reaches commitAction', async () => {
   git(hooked, 'add', '-A');
   git(hooked, 'commit', '-m', 'initial');
   const hook = join(hooked, '.git', 'hooks', 'pre-commit');
-  writeFileSync(hook, '#!/bin/sh\necho hook-rejected >&2\nexit 1\n');
+  const marker = join(scratch, 'hook-ran');
+  writeFileSync(hook, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 1\n`);
   chmodSync(hook, 0o755);
   writeFileSync(join(hooked, 'file.txt'), 'after\n');
-  const result = await commitAction(hooked, { message: 'must fail' });
+  const result = await commitAction(hooked, { message: 'hook-neutralized' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(existsSync(marker), false);
+  assert.equal(git(hooked, 'rev-list', '--count', 'HEAD').trim(), '2');
+});
+
+await test('host commit refuses repository-defined clean filters', async () => {
+  const filtered = join(scratch, 'filtered-commit');
+  mkdirSync(filtered);
+  git(filtered, 'init', '-b', 'main');
+  git(filtered, 'config', 'user.email', 'test@dsh.local');
+  git(filtered, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(filtered, 'tracked.txt'), 'one\n');
+  git(filtered, 'add', '-A');
+  git(filtered, 'commit', '-m', 'initial');
+  const marker = join(scratch, 'clean-filter-ran');
+  const payload = join(scratch, 'clean-filter');
+  writeFileSync(payload, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\ncat\n`);
+  chmodSync(payload, 0o755);
+  git(filtered, 'config', 'filter.hostile.clean', payload);
+  writeFileSync(join(filtered, '.gitattributes'), '* filter=hostile\n');
+  writeFileSync(join(filtered, 'tracked.txt'), 'two\n');
+  const result = await commitAction(filtered, { message: 'must be refused' });
   assert.equal(result.ok, false);
-  assert.equal(result.partial, true);
-  assert.equal(result.staged, true);
-  assert.match(result.message, /hook-rejected/);
-  assert.equal(git(hooked, 'rev-list', '--count', 'HEAD').trim(), '1');
+  assert.match(result.message, /executable Git config.*filter\.hostile\.clean/i);
+  assert.equal(existsSync(marker), false);
+});
+
+await test('Git-derived branch names cannot become push options', async () => {
+  const optionRepo = join(scratch, 'option-branch');
+  const optionRemote = join(scratch, 'option-remote.git');
+  const marker = join(scratch, 'receive-pack-option-ran');
+  const payload = join(scratch, 'receive-pack-option');
+  mkdirSync(optionRepo);
+  git(optionRepo, 'init', '-b', 'main');
+  git(optionRepo, 'config', 'user.email', 'test@dsh.local');
+  git(optionRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(optionRepo, 'tracked.txt'), 'one\n');
+  git(optionRepo, 'add', '-A');
+  git(optionRepo, 'commit', '-m', 'initial');
+  mkdirSync(optionRemote);
+  git(optionRemote, 'init', '--bare');
+  git(optionRepo, 'remote', 'add', 'origin', optionRemote);
+  writeFileSync(payload, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 1\n`);
+  chmodSync(payload, 0o755);
+  const branch = `--exec=${payload}`;
+  git(optionRepo, 'update-ref', `refs/heads/${branch}`, 'HEAD');
+  git(optionRepo, 'symbolic-ref', 'HEAD', `refs/heads/${branch}`);
+  const pushed = await pushAction(optionRepo);
+  assert.equal(pushed.ok, true, JSON.stringify(pushed));
+  assert.equal(existsSync(marker), false);
 });
 
 await test('pull never aborts a pre-existing merge', async () => {
@@ -304,6 +365,23 @@ await test('createWorktree branch-off', async () => {
   assert.equal(meta.intent, 'branch-off');
   // explicit name → never an auto-rename candidate (ADR 0004)
   assert.equal(meta.autoName.status, 'ineligible');
+});
+
+await test('createWorktree rolls back add and branch when metadata commit fails', async () => {
+  const expectedPath = join(await repoWorktreesRoot(repo), 'metadata-failure');
+  await assert.rejects(
+    createWorktree({
+      repoRoot: repo,
+      base: 'main',
+      intent: 'branch-off',
+      branchName: 'metadata-failure',
+      slug: 'metadata-failure',
+      metadataWriter: async () => { throw new Error('injected metadata failure'); },
+    }),
+    /injected metadata failure/,
+  );
+  assert.equal(existsSync(expectedPath), false);
+  assert.equal((await runGit(['show-ref', '--verify', '--quiet', 'refs/heads/metadata-failure'], { cwd: repo })).ok, false);
 });
 
 await test('branch-off slug placeholder + autoName pending', async () => {
@@ -721,14 +799,15 @@ await test('archive guards + archive', async () => {
   assert.equal(notManaged.reason, 'not-managed');
 });
 
-await test('archive keeps worktree when a safety revision is unknown', async () => {
+await test('archive rejects corrupt safety metadata', async () => {
   const guarded = await createWorktree({ repoRoot: repo, base: 'main', intent: 'branch-off', branchName: 'guarded-archive' });
+  const originalBase = (await readMetadata(guarded.path)).baseRef;
   await patchMetadata(guarded.path, (metadata) => ({ ...metadata, baseRef: 'refs/heads/definitely-missing' }));
   const refused = await archiveWorktree(guarded.path, {});
   assert.equal(refused.ok, false);
-  assert.equal(refused.reason, 'inspect-failed');
-  assert.equal(refused.stage, 'unpushed');
-  assert.equal(existsSync(guarded.path), true, 'unknown safety state preserves the directory');
+  assert.equal(refused.reason, 'not-managed');
+  assert.equal(existsSync(guarded.path), true, 'invalid ownership metadata preserves the directory');
+  await patchMetadata(guarded.path, (metadata) => ({ ...metadata, baseRef: originalBase }));
   const forced = await archiveWorktree(guarded.path, { force: true });
   assert.equal(forced.ok, true, JSON.stringify(forced));
 });
@@ -752,7 +831,7 @@ await test('non-force archive closes the inspect/remove race', async () => {
   mkdirSync(wrapperDir);
   const wrapper = join(wrapperDir, 'git');
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-  writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = remove ]; then printf late > "$3/late.txt"; fi\nexec "${realGit}" "$@"\n`);
+  writeFileSync(wrapper, `#!/bin/sh\nseen=\nprev=\nlast=\nfor arg do [ "$prev" = worktree ] && [ "$arg" = remove ] && seen=1; prev="$arg"; last="$arg"; done\nif [ "$seen" = 1 ]; then printf late > "$last/late.txt"; fi\nexec "${realGit}" "$@"\n`);
   chmodSync(wrapper, 0o755);
   const originalPath = process.env.PATH;
   try {
@@ -849,7 +928,7 @@ git(prRepo, 'commit', '-m', 'local main commit (never pushed)');
 const prOriginMain = git(prRepo, 'rev-parse', 'refs/remotes/origin/main').trim();
 assert.notEqual(git(prRepo, 'rev-parse', 'refs/heads/main').trim(), prOriginMain);
 
-await test('pr-checkout: same-repo PR head via refs/pull/<N>/head + tracking ref', async () => {
+await test('pr-checkout: same-repo PR head without forged tracking ref', async () => {
   // only the forge ref carries this commit: no local branch, no origin branch
   assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/pr-same-repo'), null);
   assert.equal(tryGit(prRepo, 'merge-base', '--is-ancestor', prSameRepoHead, 'main'), null, 'PR head is not on main');
@@ -865,19 +944,19 @@ await test('pr-checkout: same-repo PR head via refs/pull/<N>/head + tracking ref
     assert.equal(wt.copiedFrom, null);
     assert.equal(wt.pullNumber, 12);
     assert.equal(wt.prHeadSha, prSameRepoHead);
-    assert.equal(wt.upstream, 'origin/pr-same-repo');
+    assert.equal(wt.upstream, null);
     assert.equal(wt.baseRefName, 'main');
     assert.equal(wt.baseRef, prOriginMain, 'the base is origin/main, not the newer local main');
     // the worktree really holds the PR head, not the base
     assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead);
     assert.equal(readFileSync(join(wt.path, 'pr.txt'), 'utf8'), 'from the pr\n');
-    // the universal ref landed in the throwaway ref…
-    assert.equal(git(prRepo, 'rev-parse', 'refs/dsh-better-workspaces/pr/12/pr-same-repo').trim(), prSameRepoHead);
-    // …and origin/<headRef> was materialized from that very SHA, so the
-    // tracking ref resolves even though the branch was never pushed
+    // the fetch ref is transaction-scoped and removed after its SHA is read
+    assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/dsh-better-workspaces/pr/12/pr-same-repo'), null);
+    // A missing remote branch stays missing: PR metadata must never
+    // manufacture a remote-tracking ref from the fetched PR SHA.
     const seeded = tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/pr-same-repo');
-    assert.equal((seeded || '').trim(), prSameRepoHead, 'origin/<headRef> materialized from the fetched SHA');
-    assert.equal(git(wt.path, 'rev-parse', '--abbrev-ref', '@{upstream}').trim(), 'origin/pr-same-repo');
+    assert.equal(seeded, null);
+    assert.match(gitFailure(wt.path, 'rev-parse', '--abbrev-ref', '@{upstream}'), /no upstream|unknown revision/i);
 
     const meta = await readMetadata(wt.path);
     assert.equal(meta.intent, 'pr-checkout');
@@ -885,12 +964,27 @@ await test('pr-checkout: same-repo PR head via refs/pull/<N>/head + tracking ref
     assert.equal(meta.pullNumber, 12);
     assert.equal(meta.pullHeadRef, 'pr-same-repo');
     assert.equal(meta.prHeadSha, prSameRepoHead);
-    assert.equal(meta.upstream, 'origin/pr-same-repo');
+    assert.equal(meta.upstream, undefined);
     assert.equal(meta.baseRefName, 'main');
     assert.equal(meta.baseRef, prOriginMain);
     assert.equal(meta.sourceWorkspaceTitle, 'PR 12');
     assert.equal('pullForkOwner' in meta, false);
     assert.equal('autoName' in meta, false, 'a PR checkout is never an auto-rename candidate');
+  } finally {
+    await archiveWorktree(wt.path, { force: true });
+  }
+});
+
+await test('pr-checkout never overwrites a mismatched remote-tracking ref', async () => {
+  const before = git(prRepo, 'rev-parse', 'refs/remotes/origin/main').trim();
+  const wt = await createWorktree({
+    repoRoot: prRepo,
+    intent: 'pr-checkout',
+    pull: { number: 12, headRef: 'main', baseRef: 'main' },
+  });
+  try {
+    assert.equal(git(prRepo, 'rev-parse', 'refs/remotes/origin/main').trim(), before);
+    assert.equal(wt.upstream, null);
   } finally {
     await archiveWorktree(wt.path, { force: true });
   }
@@ -935,7 +1029,7 @@ await test('pr-checkout: fork PR → owner-prefixed branch, no upstream', async 
     assert.equal('upstream' in meta, false);
     assert.equal('autoName' in meta, false);
     // the head landed in the PR's own throwaway ref (named after the anchor)
-    assert.equal(git(prRepo, 'rev-parse', 'refs/dsh-better-workspaces/pr/9/alice/dark-mode').trim(), prForkHead);
+    assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/dsh-better-workspaces/pr/9/alice/dark-mode'), null);
     // and nothing was synthesized as the BASE repo's origin/dark-mode
     assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/dark-mode'), null);
   } finally {
@@ -1025,12 +1119,12 @@ await test('pr-checkout: guards + tolerant base', async () => {
   });
   try {
     assert.match(wt.branch, /^pr-same-repo-\d+$/);
-    assert.equal(wt.baseRefName, 'no-such-base');
-    assert.equal(wt.baseRef, 'no-such-base');
+    assert.equal(wt.baseRefName, null);
+    assert.equal(wt.baseRef, null);
     assert.equal(git(wt.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead);
     const meta = await readMetadata(wt.path);
-    assert.equal(meta.baseRefName, 'no-such-base');
-    assert.equal(meta.baseRef, 'no-such-base');
+    assert.equal(meta.baseRefName, null);
+    assert.equal(meta.baseRef, null);
   } finally {
     await archiveWorktree(wt.path, { force: true });
   }
@@ -1038,22 +1132,35 @@ await test('pr-checkout: guards + tolerant base', async () => {
 
 await test('api: POST /worktrees with pull → pr-checkout', async () => {
   const hub = createGitStateHub({ onChange: () => {} });
-  const api = createApi(hub, {});
+  const api = createApi(hub, {
+    workspaceRoots: () => [prRepo],
+    resolvePull: async ({ number }) => ({
+      ok: true,
+      item: {
+        kind: 'change_request',
+        number,
+        headRefName: 'pr-post',
+        baseRefName: 'main',
+        headOwnerLogin: null,
+        fork: false,
+      },
+    }),
+  });
   const server = http.createServer((req, res) => api.route.handler(req, res));
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
   try {
     const res = await fetch(`${base}/worktrees`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cwd: prRepo, pull: { number: 21, headRef: 'pr-post', baseRef: 'main' }, sourceTitle: 'PR 21' }),
+      headers: { 'Content-Type': 'application/json', Origin: new URL(base).origin },
+      body: JSON.stringify({ cwd: prRepo, pull: { number: 21, headRef: 'main', baseRef: 'evil', forkOwner: 'attacker' }, sourceTitle: 'PR 21' }),
     });
     const created = await res.json();
     assert.equal(created.ok, true, JSON.stringify(created));
     assert.equal(created.branch, 'pr-post');
     assert.equal(created.pullNumber, 21);
     assert.equal(created.prHeadSha, prPostHead);
-    assert.equal(created.upstream, 'origin/pr-post');
+    assert.equal(created.upstream, null);
     assert.equal(readFileSync(join(created.path, 'post.txt'), 'utf8'), 'from the http route\n');
     const meta = await readMetadata(created.path);
     assert.equal(meta.intent, 'pr-checkout');
@@ -1073,6 +1180,7 @@ await test('api: POST /worktrees with pull → pr-checkout', async () => {
 await test('api routes over real HTTP', async () => {
   const hub = createGitStateHub({ onChange: () => {} });
   const api = createApi(hub, {
+    workspaceRoots: () => [repo, scratch],
     worktreeWorkspaces: async () => [{ workspaceId: 'ws-provider-x', path: '/tmp/provider-x' }],
   });
   const server = http.createServer((req, res) => api.route.handler(req, res));
@@ -1081,7 +1189,11 @@ await test('api routes over real HTTP', async () => {
   try {
     const get = async (path) => (await fetch(base + path)).json();
     const post = async (path, body) =>
-      (await fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+      (await fetch(base + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: new URL(base).origin },
+        body: JSON.stringify(body),
+      })).json();
 
     // 400 shapes must carry `message` so the client never shows a generic fallback
     const bad = await post('/worktrees', {});
@@ -1114,7 +1226,7 @@ await test('api routes over real HTTP', async () => {
     const editable = join(repo, 'editable.txt');
     writeFileSync(editable, 'one\n');
     const baseSha = createHash('sha1').update(Buffer.from('one\n')).digest('hex');
-    const casConflict = await post('/file', { cwd: repo, path: 'editable.txt', content: 'two\n', baseSha1: 'deadbeef' });
+    const casConflict = await post('/file', { cwd: repo, path: 'editable.txt', content: 'two\n', baseSha1: '0000000000000000000000000000000000000000' });
     assert.equal(casConflict.ok, false);
     assert.equal(casConflict.error, 'conflict');
     assert.equal(readFileSync(editable, 'utf8'), 'one\n', 'conflict must not write');
@@ -1160,7 +1272,7 @@ await test('api routes over real HTTP', async () => {
     assert.equal(commits.commits[0].unpushed, true); // no remote → unpushed
     const missingCommits = await get(`/commits?cwd=${encodeURIComponent(wt1.path)}&base=refs%2Fheads%2Fdefinitely-missing`);
     assert.equal(missingCommits.ok, false);
-    assert.equal(missingCommits.stage, 'commits');
+    assert.equal(missingCommits.error, 'invalid base revision');
 
     const actions = await get(`/actions?cwd=${encodeURIComponent(wt1.path)}`);
     assert.ok(actions.ladder.some((e) => e.id === 'commit' && !e.disabled));
@@ -1428,13 +1540,14 @@ await test('forge: auth states + gh JSON flattening (list + detail)', async () =
   const missing = await pullRequestDetail({ cwd: prRepo, number: 404 });
   assert.equal(missing.ok, false);
   assert.equal(missing.authState, 'error');
+  assert.equal(missing.reason, 'not_found');
   assert.match(missing.message, /no pull requests or issues matched/);
 });
 
 await test('api: /pulls + /pull over real HTTP (fake gh)', async () => {
   rmSync(fakeGHLog, { force: true });
   const hub = createGitStateHub({ onChange: () => {} });
-  const api = createApi(hub, {});
+  const api = createApi(hub, { workspaceRoots: () => [prRepo, scratch] });
   const server = http.createServer((req, res) => api.route.handler(req, res));
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
@@ -1511,9 +1624,12 @@ await test('api: /pulls + /pull over real HTTP (fake gh)', async () => {
     assert.equal(issueExplicit.item.kind, 'issue');
 
     // a number gh does not know: a plain answer, never a 500
-    const gone = await get(`/pull?cwd=${encodeURIComponent(prRepo)}&number=404`);
+    const goneResponse = await fetch(`${base}/pull?cwd=${encodeURIComponent(prRepo)}&number=404`);
+    assert.equal(goneResponse.status, 404);
+    const gone = await goneResponse.json();
     assert.equal(gone.ok, false);
     assert.equal(gone.authState, 'error');
+    assert.equal(gone.reason, 'not_found');
     assert.match(gone.message, /no pull requests or issues matched/);
 
     // the route reports the auth state it got from the forge
@@ -1559,6 +1675,7 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   const wtClean = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'clean-sweep-0001' });
   const wtDirty = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dirty-sweep-0002' });
   const wtUnknown = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'unknown-sweep-0003' });
+  const unknownBase = (await readMetadata(wtUnknown.path)).baseRef;
   await patchMetadata(wtUnknown.path, (metadata) => ({ ...metadata, baseRef: 'refs/heads/definitely-missing' }));
   writeFileSync(join(wtDirty.path, 'junk.txt'), 'x\n');
   wsEntities.push(
@@ -1568,10 +1685,10 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   );
 
   const dry = await cleanup({ dryRun: true });
-  assert.equal(dry.ok, true, JSON.stringify(dry));
+  assert.equal(dry.ok, false, JSON.stringify(dry));
   assert.ok(dry.archived.some((a) => a.path === wtClean.path && a.dryRun === true));
   assert.ok(dry.skipped.some((s) => s.path === wtDirty.path && s.reason === 'dirty'));
-  assert.ok(dry.errors.some((entry) => entry.path === wtUnknown.path && /ahead-behind/.test(entry.message)), JSON.stringify(dry.errors));
+  assert.ok(dry.errors.some((entry) => entry.path === wtUnknown.path && /ownership: metadata-invalid/.test(entry.message)), JSON.stringify(dry.errors));
   assert.ok(existsSync(wtClean.path), 'dry run must not remove anything');
   assert.ok(existsSync(wtUnknown.path), 'unknown safety state is fail-closed even in discovery');
 
@@ -1589,15 +1706,42 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   // live session cwd → skipped 'session'
   const wtSession = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'session-sweep-0003' });
   wsEntities.push({ path: wtSession.path, workspaceId: 'ws-session-sweep-0003' });
+  const liveSubdir = join(wtSession.path, 'active-session-subdir');
+  mkdirSync(liveSubdir);
   const guarded = await createCleanup({
     get(name) {
-      if (name === 'sessions') return { list: () => [{ id: 'live-host-session', header: { cwd: wtSession.path }, seq: 1 }] };
+      if (name === 'sessions') return { list: () => [{ id: 'live-host-session', header: { cwd: liveSubdir }, seq: 1 }] };
       if (name === 'workspaceRegistry') return registryMock;
       return undefined;
     },
   })({});
   assert.ok(guarded.skipped.some((s) => s.path === wtSession.path && s.reason === 'session'));
   assert.ok(existsSync(wtSession.path));
+
+  // A session that starts after the initial snapshot is rechecked at the
+  // destructive boundary and must still prevent archival.
+  const raceRepo = join(scratch, 'cleanup-session-race-repo');
+  mkdirSync(raceRepo);
+  git(raceRepo, 'init', '-b', 'main');
+  git(raceRepo, 'config', 'user.email', 'test@dsh.local');
+  git(raceRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(raceRepo, 'tracked.txt'), 'one\n');
+  git(raceRepo, 'add', '-A');
+  git(raceRepo, 'commit', '-m', 'initial');
+  const wtRaceSession = await createWorktree({ repoRoot: raceRepo, intent: 'branch-off', slug: 'session-race' });
+  let sessionReads = 0;
+  const raceGuarded = await createCleanup({
+    get(name) {
+      if (name === 'sessions') return {
+        list: () => (++sessionReads === 1 ? [] : [{ id: 'late-session', header: { cwd: wtRaceSession.path }, seq: 1 }]),
+      };
+      if (name === 'workspaceRegistry') return registryMock;
+      return undefined;
+    },
+  })({ cwd: raceRepo });
+  assert.ok(raceGuarded.skipped.some((s) => s.path === wtRaceSession.path && s.reason === 'session'), JSON.stringify(raceGuarded));
+  assert.ok(existsSync(wtRaceSession.path));
+  await archiveWorktree(wtRaceSession.path, { force: true });
 
   // session guard unavailable without opt-in → refuse
   const refused = await createCleanup({ get: () => undefined })({});
@@ -1610,6 +1754,7 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   assert.ok(!existsSync(wtSession.path));
 
   await archiveWorktree(wtDirty.path, { force: true });
+  await patchMetadata(wtUnknown.path, (metadata) => ({ ...metadata, baseRef: unknownBase }));
   await archiveWorktree(wtUnknown.path, { force: true });
 });
 
@@ -1664,6 +1809,31 @@ await test('cleanup abandoned sweep: blank+old only', async () => {
   assert.ok(report.skipped.some((s) => s.path === wtBusy.path && s.reason === 'session'));
   assert.ok(!existsSync(wtOld.path));
   assert.ok(existsSync(wtFresh.path) && existsSync(wtBusy.path));
+
+  const abandonedRaceRepo = join(scratch, 'cleanup-abandoned-race-repo');
+  mkdirSync(abandonedRaceRepo);
+  git(abandonedRaceRepo, 'init', '-b', 'main');
+  git(abandonedRaceRepo, 'config', 'user.email', 'test@dsh.local');
+  git(abandonedRaceRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(abandonedRaceRepo, 'tracked.txt'), 'one\n');
+  git(abandonedRaceRepo, 'add', '-A');
+  git(abandonedRaceRepo, 'commit', '-m', 'initial');
+  const wtLateBusy = await createWorktree({ repoRoot: abandonedRaceRepo, intent: 'branch-off', slug: 'late-busy' });
+  await patchMetadata(wtLateBusy.path, (metadata) => ({ ...metadata, createdAt: aged }));
+  let abandonedSessionReads = 0;
+  const lateBusy = await createCleanup({
+    get(name) {
+      if (name === 'sessions') return {
+        list: () => [{ id: 'late-busy-session', header: { cwd: wtLateBusy.path }, seq: ++abandonedSessionReads === 1 ? 0 : 1 }],
+      };
+      if (name === 'workspaceRegistry') return registryMock;
+      return undefined;
+    },
+  })({ cwd: abandonedRaceRepo, abandoned: true, minAgeMs: 60000 });
+  assert.ok(lateBusy.skipped.some((item) => item.path === wtLateBusy.path && item.reason === 'session'), JSON.stringify(lateBusy));
+  assert.ok(existsSync(wtLateBusy.path));
+  await archiveWorktree(wtLateBusy.path, { force: true });
+
   for (const target of [wtFresh.path, wtBusy.path]) await archiveWorktree(target, { force: true });
 });
 
