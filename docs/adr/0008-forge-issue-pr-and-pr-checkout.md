@@ -70,6 +70,26 @@ hero 这一侧的语义来自 paseo 的 `checkout-change-request`：PR 不是基
 失败方式都是静默的。
 
 
+**B3. 失败必须自己上报，因为官方这条路径用「返回 false」而不是异常。**
+从「点中一行」到「屏幕上出现 chip」之间至少四个静默出口：`resolveForgeSessionInput` 自己的
+catch、`insertReference` 用 `return false` 表达拒绝（phase 不是 plain/claimed、span 的
+`draftRev` 与 shell 的 CAS 不符）、`setDraft` 在「清洗后与当前草稿相同」时**直接 return**
+不写入、以及降级路径的 catch。任何一处生效，点击都会表现为「什么都没有发生」，而调用方
+无法区分是哪一处。因此本控件对**两条路都失败**的情况调用官方的输入框提示通道
+`shell.notify("error", t("forge.attachFailed", { reason }))`（`notify` 是 `SessionInput`
+的公开成员，官方自身也用它报队列/命令失败），把静默变成可见。
+配套的诊断通道：`localStorage.setItem("dsh-bw-debug", "1")` 后刷新页面，`forgeTrace` 会把
+`resolve → resolve.shell → caret → insert → fallback → done` 每一步的判定值打到
+`console.warn("[better-workspaces:forge]", …)`；关闭时零开销，`localStorage` 不可用时
+静默关闭（Node 测试里天然关着）。
+
+**B4. 插入点由「草稿末尾」决定，而不是当前光标。**
+`caretSpan()` 有选区时返回选区：选择器是对话框，用户点它时光标可能停在正文中间，照搬会让
+chip 把已有文字切开。本控件的语义因此是「追加」——只有当 `caretSpan()` 给的是草稿末尾的
+塌缩光标时才采用它，否则回落到重算的草稿末尾。span 的 `draftRev` **始终取 shell 自己的
+`rev`**（`caretSpan()` 不返回 rev），而不是组件渲染期的 `InputState.draftRev`：后者只要比
+shell 落后一次编辑，CAS 就会拒绝，症状同样是静默。
+
 **C. PR 行 = 检出 head，绝不是可切的基。**
 `pr-checkout` 取 forge 的通用 head ref `refs/pull/<N>/head`（origin 优先、upstream
 次之）——这是 fork 贡献唯一存在的 ref；随后用

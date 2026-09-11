@@ -377,15 +377,19 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     'and degrades to null when the session has no scope',
   );
 
-  // (b) the chip path: the shell's own caretSpan is the insertion point
+  // (b) the chip path: the shell's own caretSpan is the insertion point, and the
+  // revision comes from the SHELL, not the component's render-time snapshot
+  sessionInput.rev = 9;
   sessionInput.caretSpan = () => ({ start: 5, end: 5, draftRev: 3 });
   sessionInput.snapshot = { draft: 'hello' };
   let usedFallback = false;
+  let notified = null;
+  sessionInput.notify = (level, text) => { notified = { level, text }; };
   sessionInput.setDraft = () => { usedFallback = true; };
   sessionInput.insertReference = (ref, span) => {
     assert.equal(resolvedWith, 's-1', 'the reference resolves before insertion');
-    assert.deepEqual(span, { start: 5, end: 5, draftRev: 3 },
-      'the insertion point is the shell caret span, NOT a hand-built offset');
+    assert.deepEqual(span, { start: 5, end: 5, draftRev: 9 },
+      'the span carries the shell’s live rev (a stale render-time rev would fail the CAS)');
     assert.equal(ref.source, 'better-workspaces-forge', 'the reference names our trigger source');
     assert.equal(ref.ref, '7', 'and carries the picked number');
     assert.equal(ref.clipboardText, '@7', 'with the clipboard form the decoration scans');
@@ -394,24 +398,72 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
   };
   assert.equal(
     mod.__bwTest.attachForgeReference({
-      item, sessions: ctx.sessions, sessionInput,
-      fallbackSpan: { start: 0, end: 0, draftRev: 0 }, fallbackDraft: '',
+      item, sessionInput,
+      fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
     }),
     true,
     'the picked row lands a reference chip',
   );
   assert.equal(usedFallback, false, 'the chip path never needs the plain-text degradation');
+  assert.equal(notified, null, 'and a successful attach stays quiet');
 
   // (c) degradation: a refused chip still leaves the token in the draft
-  sessionInput.caretSpan = () => ({ start: 5, end: 5, draftRev: 3 });
   sessionInput.insertReference = () => false;
   usedFallback = false;
   mod.__bwTest.attachForgeReference({
-    item, sessions: ctx.sessions, sessionInput,
-    fallbackSpan: { start: 0, end: 0, draftRev: 0 }, fallbackDraft: 'hello',
+    item, sessionInput,
+    fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
   });
   assert.equal(usedFallback, true, 'a refused chip degrades to a plain-text append');
+
+  // (d) both roads closed: the failure must reach the composer, not vanish.
+  // `insertReference` answers false instead of throwing and `setDraft` returns
+  // without a write when the draft is unchanged, so an unreported failure is
+  // indistinguishable from "the click did nothing".
+  sessionInput.insertReference = () => false;
+  sessionInput.setDraft = () => { throw new Error('composer locked'); };
+  notified = null;
+  assert.equal(
+    mod.__bwTest.attachForgeReference({
+      item, sessionInput,
+      fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
+    }),
+    false,
+    'a fully refused attach reports failure',
+  );
+  assert.ok(notified, 'and surfaces it on the composer notice channel');
+  assert.equal(notified.level, 'error', 'as an error notice');
+  assert.ok(notified.text.startsWith(dictionaries.dicts.zh['forge.attachFailed'].split('{reason}')[0]),
+    `with the localized template: ${notified.text}`);
+  assert.match(notified.text, /composer locked/, 'carrying the underlying reason');
+
+  // (e) no shell at all (resolution failed): same duty, using the no-target copy
+  notified = null;
+  mod.__bwTest.attachForgeReference({
+    item, sessionInput: null,
+    fallbackSpan: { start: 0, end: 0, draftRev: 0 }, fallbackDraft: '',
+  });
+  assert.equal(notified, null, 'with no shell there is no channel to report on');
+
+  // (f) a caret parked mid-text must not be split by a dialog-driven pick
+  sessionInput.setDraft = () => { usedFallback = true; };
+  let chipSpan = null;
+  sessionInput.caretSpan = () => ({ start: 2, end: 2, draftRev: 3 });
+  sessionInput.insertReference = (ref, span) => { chipSpan = span; return true; };
+  mod.__bwTest.attachForgeReference({
+    item, sessionInput,
+    fallbackSpan: { start: 5, end: 5, draftRev: 0 }, fallbackDraft: 'hello',
+  });
+  assert.deepEqual(chipSpan, { start: 5, end: 5, draftRev: 9 },
+    'an off-end caret falls back to the draft end instead of splitting the text');
 }
+
+/* The resolver's shape is a contract, not an implementation detail: a session
+   BINDING has no scope tag, so `binding.ctx` must never come back. */
+assert.ok(
+  !/binding\.ctx/.test(source),
+  'the forge resolver never hands a session binding to `conversation.input.for`',
+);
 
 /* ---------------- diff as an official right-Sidebar page type ---------------- */
 assert.equal(tabTypes.length, 1, 'exactly one right-Sidebar tab type');
