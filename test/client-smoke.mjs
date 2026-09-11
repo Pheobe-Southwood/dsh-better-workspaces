@@ -361,8 +361,14 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
       },
     },
   };
+  /* The resolver asks for the "conversation" SERVICE. The official plugin also
+     registers an unrelated class under `uiConversation` that has no `input`
+     member — asking for that key is exactly the bug that made every attach a
+     silent no-op, so the mock answers `undefined` for it and wires only the real
+     key. `get` answers undefined for anything else, which also proves the
+     resolver tolerates a not-yet-available service. */
   const originalGet = ctx.get?.bind(ctx);
-  ctx.get = (name) => (name === 'uiConversation' ? conversation : originalGet ? originalGet(name) : undefined);
+  ctx.get = (name) => (name === 'conversation' ? conversation : originalGet ? originalGet(name) : undefined);
 
   const item = { number: 7, kind: 'change_request', title: 'wire up the picker', state: 'OPEN' };
   // (a) a binding is NOT a session scope: it must resolve to null, not throw
@@ -463,6 +469,23 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
 assert.ok(
   !/binding\.ctx/.test(source),
   'the forge resolver never hands a session binding to `conversation.input.for`',
+);
+/* And the service key is a contract too: the resolver must ask for
+   "conversation" (the class that carries `input`), never "uiConversation" (an
+   unrelated class with no `input` member). Asking for the wrong key returns
+   undefined and turns every pick into a silent no-op. Comments are stripped
+   first, because the code documents the wrong key by name. */
+const codeOnly = source
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+assert.ok(
+  !/\.get\(\s*["']uiConversation["']\s*\)/.test(codeOnly),
+  'the forge path resolves the "conversation" service, not the uiConversation class',
+);
+assert.match(
+  codeOnly,
+  /\.get\(\s*["']conversation["']\s*\)/,
+  'and it actually asks for that service',
 );
 
 /* ---------------- diff as an official right-Sidebar page type ---------------- */

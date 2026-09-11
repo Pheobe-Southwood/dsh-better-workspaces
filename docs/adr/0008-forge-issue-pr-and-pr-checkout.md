@@ -56,6 +56,30 @@ hero 这一侧的语义来自 paseo 的 `checkout-change-request`：PR 不是基
 `insertReference` 因 revision CAS 或输入阶段拒绝写入时，退回 `setDraft` 追加纯文本
 `@N`；装饰扫描按词表把 `@N` 重新渲染成 chip，代价只是光标落在草稿末尾。
 
+**B1. 服务键是 `conversation`，不是 `uiConversation` —— 这是「点了没反应」的真正原因。**
+官方 `dsh-client-ui-conversation` 注册了**两个不同的服务类**，只有一个带 `SessionInputResolver`：
+
+```js
+var UiConversation = class extends Service { ... }              // super(ctx, "uiConversation") —— 没有 input 成员
+      ConversationController = class extends Service {           // super(ctx, "conversation")
+        constructor(ctx, config) { this.input = config.input; }  // ← 解析器在这里
+```
+
+`uiConversation` 只是官方 apply 里的**局部变量名**（`const uiConversation = new UiConversation(...)`），
+从来不是服务键。因此 `appCtx.get("uiConversation")` 永远返回 undefined，而解析器里的
+`if (!conversation || !conversation.input) return null` 会在**任何点击之前**就把整条链短路：
+`sessionInput = null` → `insertReference` 与 `setDraft` 两步都被跳过 → 点击表现为完全无事发生。
+这个键错误此前**无法被任何静态检查发现**：`ctx.get` 对未知名返回 undefined 而不是抛错，而
+`uiConversation` 这个名字在官方源码里到处可见（它是局部变量与另一个真实服务名），看起来完全合理。
+
+同一个键错误还影响一处**既有**代码：hero 的 `prepareStagedWorktree` 用
+`appCtx.get("uiConversation")` 拿 `conversation.blocks`，因此「创建 worktree 时锁住输入框」的
+提示一直是**静默不生效**的。两处现在都改为 `get("conversation")`。
+
+护栏（`test/client-smoke.mjs`）：mock 的 `ctx.get` 只对 `"conversation"` 回答案例对象的服务，
+对 `"uiConversation"` 明确返回 undefined；另有静态断言（先剥注释，因为注释里按名字写了错误键）
+要求源码中出现 `.get("conversation")` 且不出现 `.get("uiConversation")`。
+
 **B2. 写入路径的两个契约事实（第一版都踩了，见 ADR 0009）。**
 命中一行到草稿里出现小片，中间只有两次官方调用，而两次都要求调用方知道契约：
 其一，**解析会话输入必须用 `sessions.scope(id)` 拿到的 ctx**——`conversation.input.for(actx)`
