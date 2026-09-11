@@ -82,6 +82,13 @@ const inputTriggers = {
   },
 };
 
+/* The session-scope tag. `conversation.input.for(actx)` resolves its session
+   through it, so the mock service below can accept the right ctx and reject a
+   session binding exactly like the real implementation (`scopeOf` →
+   `ctx[kScope]`, undefined for anything untagged). */
+const SESSION_SCOPE = Symbol('session-scope');
+let sessionSnapshot = { byId: {}, ids: [], current: undefined, phase: 'ready' };
+
 const ctx = {
   // a hard inject would make `sidebarRightTabs` a ctx property inside the fiber
   sidebarRightTabs,
@@ -140,10 +147,21 @@ const ctx = {
   },
   sessions: {
     list: {
-      getSnapshot: () => ({ byId: {}, ids: [], current: undefined, phase: 'ready' }),
+      getSnapshot: () => sessionSnapshot,
       subscribe: () => () => {},
     },
     open() {},
+    /* `input.for(actx)` resolves the session through a PRIVATE tag the sessions
+       service stamps on the ctx it materializes per session; a session binding
+       has no such tag. Model both, so a fix that passes the wrong one fails
+       here instead of silently doing nothing in the browser (see the insert
+       guard below). */
+    scope(id) {
+      return id === undefined ? undefined : { [SESSION_SCOPE]: id };
+    },
+    binding(id) {
+      return id === undefined ? undefined : { sessionId: id, ctx: { isScope: false } };
+    },
   },
   workspaces: { items: [], create: async () => ({ ok: false }) },
 };
@@ -242,15 +260,11 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     // reconciliation, which is not what this guard is about.
     reactDomServer = null;
   }
-  const { ForgeAttachControl } = mod.__bwTest;
+  const { ForgeAttachControl, ForgePicker } = mod.__bwTest;
   assert.equal(typeof ForgeAttachControl, 'function', 'the control is exported for this suite');
   // the control asks the session list for its cwd and renders nothing without
   // one (that guard is deliberate), so give the mock a session that has one
-  const liveSnapshot = ctx.sessions.list.getSnapshot();
-  ctx.sessions.list.getSnapshot = () => ({
-    ...liveSnapshot,
-    byId: { ...liveSnapshot.byId, 's-1': { cwd: '/tmp' } },
-  });
+  sessionSnapshot = { ...sessionSnapshot, byId: { ...sessionSnapshot.byId, 's-1': { cwd: '/tmp' } } };
   const hooks = [];
   const useInput = (selector) => {
     hooks.push(['useInput', typeof selector]);
@@ -297,6 +311,106 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     types.includes('button'),
     'the control renders a real button element',
   );
+
+  /* ---- the pick path: selecting a row must actually reach the composer ----
+     Two live bugs hid behind this, both silent:
+       1. `conversation.input.for(actx)` resolves the session via a private
+          scope tag, so handing it a session BINDING throws — and the catch
+          turned that into "nothing happens";
+       2. the insertion span was rebuilt by hand from occurrence offsets, but
+          those `length`s are CLIPBOARD coordinates while a chip occupies zero
+          detect characters, so the span overshot the draft end.
+     Driving the real element tree covers both: the resolution must land on the
+     scope ctx, and the span must be the shell's own caretSpan(). */
+  const forgeButton = (() => {
+    let found = null;
+    const seek = (node) => {
+      if (found || node === null || node === undefined) return;
+      if (Array.isArray(node)) { for (const child of node) seek(child); return; }
+      if (typeof node !== 'object') return;
+      if (node.props?.className === 'dsh-bw-forge-btn') { found = node; return; }
+      seek(node.children);
+      seek(node.props?.children);
+    };
+    seek(tree);
+    return found;
+  })();
+  assert.ok(forgeButton, 'the forge button is walkable in the returned tree');
+
+  /* ---- the pick path: a chosen row must actually reach the composer ----
+     Two live bugs hid here, both silent:
+       1. `conversation.input.for(actx)` resolves the session through a private
+          scope tag, so handing it a session BINDING throws — and the catch in
+          the pick handler turned that into "nothing happens at all";
+       2. the insertion span was rebuilt by hand from `occurrences`, whose
+          `length` is a CLIPBOARD length while a chip occupies zero detect
+          characters — so the span overshot the draft end.
+     Drive the exported path directly (the control calls the same function), and
+     assert the resolution target, the span, and the reference payload. */
+  const console_ = ctx.__bwAppCtx;
+  assert.equal(console_, ctx, 'the entry exposed its own app ctx for this suite');
+  const sessionInput = {};
+  let resolvedWith = 'never called';
+  const conversation = {
+    input: {
+      for(actx) {
+        resolvedWith = actx[SESSION_SCOPE];
+        assert.equal(resolvedWith, 's-1',
+          'input.for must receive the session SCOPE ctx, never a session binding');
+        return sessionInput;
+      },
+    },
+  };
+  const originalGet = ctx.get?.bind(ctx);
+  ctx.get = (name) => (name === 'uiConversation' ? conversation : originalGet ? originalGet(name) : undefined);
+
+  const item = { number: 7, kind: 'change_request', title: 'wire up the picker', state: 'OPEN' };
+  // (a) a binding is NOT a session scope: it must resolve to null, not throw
+  assert.equal(
+    mod.__bwTest.resolveForgeSessionInput({ scope: (id) => ({ [SESSION_SCOPE]: id }) }, 's-1'),
+    sessionInput,
+    'the resolver lands the scope ctx that `input.for` accepts',
+  );
+  assert.equal(
+    mod.__bwTest.resolveForgeSessionInput({ scope: () => undefined }, 's-1'),
+    null,
+    'and degrades to null when the session has no scope',
+  );
+
+  // (b) the chip path: the shell's own caretSpan is the insertion point
+  sessionInput.caretSpan = () => ({ start: 5, end: 5, draftRev: 3 });
+  sessionInput.snapshot = { draft: 'hello' };
+  let usedFallback = false;
+  sessionInput.setDraft = () => { usedFallback = true; };
+  sessionInput.insertReference = (ref, span) => {
+    assert.equal(resolvedWith, 's-1', 'the reference resolves before insertion');
+    assert.deepEqual(span, { start: 5, end: 5, draftRev: 3 },
+      'the insertion point is the shell caret span, NOT a hand-built offset');
+    assert.equal(ref.source, 'better-workspaces-forge', 'the reference names our trigger source');
+    assert.equal(ref.ref, '7', 'and carries the picked number');
+    assert.equal(ref.clipboardText, '@7', 'with the clipboard form the decoration scans');
+    assert.ok(ref.label.includes('#7'), `the chip label names the item: ${ref.label}`);
+    return true;
+  };
+  assert.equal(
+    mod.__bwTest.attachForgeReference({
+      item, sessions: ctx.sessions, sessionInput,
+      fallbackSpan: { start: 0, end: 0, draftRev: 0 }, fallbackDraft: '',
+    }),
+    true,
+    'the picked row lands a reference chip',
+  );
+  assert.equal(usedFallback, false, 'the chip path never needs the plain-text degradation');
+
+  // (c) degradation: a refused chip still leaves the token in the draft
+  sessionInput.caretSpan = () => ({ start: 5, end: 5, draftRev: 3 });
+  sessionInput.insertReference = () => false;
+  usedFallback = false;
+  mod.__bwTest.attachForgeReference({
+    item, sessions: ctx.sessions, sessionInput,
+    fallbackSpan: { start: 0, end: 0, draftRev: 0 }, fallbackDraft: 'hello',
+  });
+  assert.equal(usedFallback, true, 'a refused chip degrades to a plain-text append');
 }
 
 /* ---------------- diff as an official right-Sidebar page type ---------------- */

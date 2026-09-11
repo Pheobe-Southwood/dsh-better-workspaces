@@ -56,6 +56,20 @@ hero 这一侧的语义来自 paseo 的 `checkout-change-request`：PR 不是基
 `insertReference` 因 revision CAS 或输入阶段拒绝写入时，退回 `setDraft` 追加纯文本
 `@N`；装饰扫描按词表把 `@N` 重新渲染成 chip，代价只是光标落在草稿末尾。
 
+**B2. 写入路径的两个契约事实（第一版都踩了，见 ADR 0009）。**
+命中一行到草稿里出现小片，中间只有两次官方调用，而两次都要求调用方知道契约：
+其一，**解析会话输入必须用 `sessions.scope(id)` 拿到的 ctx**——`conversation.input.for(actx)`
+内部走 `sessions.scopeOf(ctx)`，读的是 sessions 服务自己打在**每会话 ctx** 上的私有 tag；
+会话*binding* 上没有这个 tag，传进去会抛「requires a session scope」，而调用点若把异常
+吞掉就变成**完全没反应**。其二，**插入点必须取 shell 自己的 `caretSpan()`**（无选区时回答
+`detectText.length`，即草稿末尾，同时带来最新的 `draftRev`），不能拿
+`InputState.occurrences` 手算：occurrence 的 `offset` 与 `length` 中，`offset` 是 detect
+投影坐标而 `length` 是**剪贴板投影**长度，chip 在 detect 投影里占 **0** 个字符，于是
+`offset + length` 在草稿里有第一个 chip 时就冲过末尾。两条都做成了可离线复现的断言
+（`attachForgeReference` / `resolveForgeSessionInput` 从 `__bwTest` 出），因为这两处的
+失败方式都是静默的。
+
+
 **C. PR 行 = 检出 head，绝不是可切的基。**
 `pr-checkout` 取 forge 的通用 head ref `refs/pull/<N>/head`（origin 优先、upstream
 次之）——这是 fork 贡献唯一存在的 ref；随后用
