@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,11 +14,11 @@ const scratch = mkdtempSync(join(tmpdir(), 'dsh-bw-test-'));
 process.env.DSH_HOME = join(scratch, 'dshhome');
 mkdirSync(process.env.DSH_HOME, { recursive: true });
 
-const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind } = await import('../lib/git.js');
-const { createWorktree, listManagedWorktrees, readMetadata, archiveWorktree, worktreesRoot } = await import('../lib/worktree.js');
+const { detectRepo, resolveDefaultBranch, listBranches, diffStat, porcelainStatus, aheadBehind, runGit, listCommits, unpushedShas } = await import('../lib/git.js');
+const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, worktreesRoot } = await import('../lib/worktree.js');
 const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
-const { commitAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
+const { commitAction, pullAction, discardAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
 const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable } = await import('../lib/forge.js');
@@ -65,6 +65,232 @@ await test('branches + default branch', async () => {
   const names = branches.map((b) => b.name).sort();
   assert.deepEqual(names, ['feature', 'main']);
   assert.equal(branches.every((b) => b.hasLocal), true);
+});
+
+await test('runGit accepted exits never hide process failures', async () => {
+  const missing = await runGit(['rev-parse', '--verify', 'refs/heads/missing'], { cwd: repo });
+  assert.equal(missing.ok, false);
+  assert.notEqual(missing.code, 0);
+
+  const ordinary = await runGit(['diff', '--no-index', '--', '/dev/null', 'a.txt'], { cwd: repo });
+  assert.equal(ordinary.code, 1);
+  assert.equal(ordinary.ok, false, 'exit 1 is a failure unless the caller explicitly accepts it');
+  const expectedDifference = await runGit(['diff', '--no-index', '--', '/dev/null', 'a.txt'], {
+    cwd: repo,
+    acceptedExitCodes: [0, 1],
+  });
+  assert.equal(expectedDifference.code, 1);
+  assert.equal(expectedDifference.ok, true, 'diff --no-index is the sole exit-1 success');
+
+  const missingExecutable = await runGit(['status'], { cwd: repo, env: { PATH: '' }, acceptedExitCodes: [0, 1] });
+  assert.equal(missingExecutable.ok, false, 'ENOENT string codes must never alias accepted numeric exit 1');
+  assert.equal(missingExecutable.code, 'ENOENT');
+
+  const timedOut = await runGit(['-c', 'alias.wait=!sleep 1', 'wait'], { cwd: repo, timeout: 20, acceptedExitCodes: [0, 1] });
+  assert.equal(timedOut.ok, false, 'killed/time-limited processes always fail');
+  assert.equal(timedOut.timedOut, true);
+});
+
+await test('git observation failures are explicit unknowns', async () => {
+  const status = await porcelainStatus(scratch);
+  assert.equal(status.ok, false);
+  assert.equal(status.dirty, null);
+  const delta = await aheadBehind(repo, 'refs/heads/definitely-missing');
+  assert.equal(delta.ok, false);
+  assert.equal(delta.ahead, null);
+  assert.equal(delta.behind, null);
+  const unpushed = await unpushedShas(repo, 'refs/remotes/origin/definitely-missing');
+  assert.equal(unpushed.ok, false);
+  assert.equal(unpushed.shas, null);
+  const commits = await listCommits(repo, 'refs/heads/definitely-missing..HEAD');
+  assert.equal(commits.ok, false);
+  assert.equal(commits.commits, null);
+});
+
+await test('broken HEAD is not misclassified as unborn', async () => {
+  const broken = join(scratch, 'broken-head');
+  mkdirSync(broken);
+  git(broken, 'init', '-b', 'main');
+  git(broken, 'config', 'user.email', 'test@dsh.local');
+  git(broken, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(broken, 'tracked.txt'), 'committed\n');
+  git(broken, 'add', '-A');
+  git(broken, 'commit', '-m', 'initial');
+  writeFileSync(join(broken, '.git', 'refs', 'heads', 'main'), 'bad\n');
+  writeFileSync(join(broken, 'untracked.txt'), 'must not look like a new repository\n');
+  const stat = await diffStat(broken, null);
+  assert.equal(stat.ok, false);
+  assert.equal(stat.additions, null);
+  await assert.rejects(() => computeDiff(broken, { mode: 'uncommitted' }), /HEAD|reference|resolve/i);
+  const hub = createGitStateHub({ emit: () => {} });
+  try {
+    const snapshot = await hub.snapshotFor(broken);
+    assert.equal(snapshot.gitKnown.head, false);
+    assert.equal(snapshot.gitKnown.aheadBehind, false);
+    assert.ok(snapshot.degraded.some((entry) => entry.stage === 'head'));
+    const ladder = buildActionLadder(snapshot);
+    const enabledMutations = ladder.filter((entry) => !entry.readOnly && entry.kind !== 'link' && !entry.disabled);
+    assert.deepEqual(enabledMutations, []);
+    const discarded = await discardAction(broken, {});
+    assert.equal(discarded.ok, false);
+    assert.equal(discarded.stage, 'head');
+    assert.equal(readFileSync(join(broken, 'untracked.txt'), 'utf8'), 'must not look like a new repository\n');
+    const committed = await commitAction(broken, { message: 'must not stage' });
+    assert.equal(committed.ok, false);
+    assert.equal(committed.stage, 'head');
+    assert.equal(git(broken, 'ls-files', '--cached', '--', 'untracked.txt').trim(), '');
+  } finally {
+    await hub.dispose();
+  }
+});
+
+await test('porcelain -z preserves special and rename paths; no-newline text counts one line', async () => {
+  const special = join(scratch, 'special-paths');
+  mkdirSync(special);
+  git(special, 'init', '-b', 'main');
+  git(special, 'config', 'user.email', 'test@dsh.local');
+  git(special, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(special, 'old name.txt'), 'old\nkeep\nstay\n');
+  mkdirSync(join(special, 'contains b'));
+  writeFileSync(join(special, 'contains b', 'tracked.txt'), 'one\ntwo\nthree\n');
+  writeFileSync(join(special, 'contains b', 'deleted.txt'), 'delete\nme\n');
+  const astralPath = 'emoji-😀\nfile.txt';
+  writeFileSync(join(special, astralPath), 'before\n');
+  git(special, 'add', '-A');
+  git(special, 'commit', '-m', 'initial');
+  git(special, 'mv', 'old name.txt', 'new "name".txt');
+  writeFileSync(join(special, 'new "name".txt'), 'old\nkeep\nstay\nchanged\n');
+  writeFileSync(join(special, 'contains b', 'tracked.txt'), 'one\ntwo\nthree\nfour\n');
+  rmSync(join(special, 'contains b', 'deleted.txt'));
+  writeFileSync(join(special, astralPath), 'before\nafter\n');
+  const names = ['space name.txt', 'back\\slash.txt', 'unicodé.txt', 'line\nbreak.txt', 'bell\u0007.txt', 'vertical\u000b.txt'];
+  for (const name of names) writeFileSync(join(special, name), 'one line without newline');
+  const status = await porcelainStatus(special);
+  assert.equal(status.ok, true);
+  for (const name of names) assert.ok(status.entries.some((entry) => entry.path === name), `lossless path: ${JSON.stringify(name)}`);
+  const renamed = status.entries.find((entry) => /R/.test(entry.code));
+  assert.equal(renamed.path, 'new "name".txt');
+  assert.equal(renamed.oldPath, 'old name.txt');
+  const stat = await diffStat(special, 'HEAD');
+  assert.equal(stat.ok, true);
+  assert.equal(stat.additions, names.length + 3, 'no-newline files and all tracked edits count');
+  const diff = await computeDiff(special, { mode: 'uncommitted' });
+  for (const name of names) assert.ok(diff.files.some((entry) => entry.path === name), `diff path: ${JSON.stringify(name)}`);
+  const renamedDiff = diff.files.find((entry) => entry.path === 'new "name".txt');
+  assert.equal(renamedDiff.oldPath, 'old name.txt', 'rename paths stay lossless');
+  assert.ok(renamedDiff.hunks.some((hunk) => hunk.lines.some((line) => line.type === 'add' && line.content === 'changed')),
+    'quoted rename path still joins its parsed patch');
+  const ambiguousDiff = diff.files.find((entry) => entry.path === 'contains b/tracked.txt');
+  assert.ok(ambiguousDiff.hunks.some((hunk) => hunk.lines.some((line) => line.type === 'add' && line.content === 'four')),
+    'an unquoted header containing the ` b/` delimiter still joins its parsed patch');
+  const astralDiff = diff.files.find((entry) => entry.path === astralPath);
+  assert.ok(astralDiff.hunks.some((hunk) => hunk.lines.some((line) => line.type === 'add' && line.content === 'after')),
+    'astral Unicode plus a quoted newline survives C-path decoding');
+  const deletedDiff = diff.files.find((entry) => entry.path === 'contains b/deleted.txt');
+  assert.ok(deletedDiff.hunks.some((hunk) => hunk.lines.some((line) => line.type === 'del' && line.content === 'delete')),
+    'deleted path uses its exact old marker as the patch key');
+});
+
+await test('discard handles a true unborn repository without a fake reset failure', async () => {
+  const unborn = join(scratch, 'unborn-discard');
+  mkdirSync(unborn);
+  git(unborn, 'init', '-b', 'main');
+  git(unborn, 'config', 'user.email', 'test@dsh.local');
+  git(unborn, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(unborn, 'only-untracked.txt'), 'temporary\n');
+  git(unborn, 'add', 'only-untracked.txt');
+  const orphanTree = git(unborn, 'write-tree').trim();
+  const orphanCommit = git(unborn, 'commit-tree', orphanTree, '-m', 'prefix child').trim();
+  git(unborn, 'update-ref', 'refs/heads/main/topic', orphanCommit);
+  git(unborn, 'rm', '--cached', 'only-untracked.txt');
+  const unbornStat = await diffStat(unborn, null);
+  assert.equal(unbornStat.ok, true);
+  assert.equal(unbornStat.additions, 1);
+  const unbornDiff = await computeDiff(unborn, { mode: 'uncommitted' });
+  assert.ok(unbornDiff.files.some((entry) => entry.path === 'only-untracked.txt'));
+  const result = await discardAction(unborn, {});
+  assert.equal(result.ok, true);
+  assert.equal(result.partial, undefined);
+  assert.equal(existsSync(join(unborn, 'only-untracked.txt')), false, 'unborn discard cleans untracked files');
+});
+
+await test('commit hook rejection reaches commitAction', async () => {
+  const hooked = join(scratch, 'hooked-commit');
+  mkdirSync(hooked);
+  git(hooked, 'init', '-b', 'main');
+  git(hooked, 'config', 'user.email', 'test@dsh.local');
+  git(hooked, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(hooked, 'file.txt'), 'before\n');
+  git(hooked, 'add', '-A');
+  git(hooked, 'commit', '-m', 'initial');
+  const hook = join(hooked, '.git', 'hooks', 'pre-commit');
+  writeFileSync(hook, '#!/bin/sh\necho hook-rejected >&2\nexit 1\n');
+  chmodSync(hook, 0o755);
+  writeFileSync(join(hooked, 'file.txt'), 'after\n');
+  const result = await commitAction(hooked, { message: 'must fail' });
+  assert.equal(result.ok, false);
+  assert.equal(result.partial, true);
+  assert.equal(result.staged, true);
+  assert.match(result.message, /hook-rejected/);
+  assert.equal(git(hooked, 'rev-list', '--count', 'HEAD').trim(), '1');
+});
+
+await test('pull never aborts a pre-existing merge', async () => {
+  const merging = join(scratch, 'preexisting-merge');
+  mkdirSync(merging);
+  git(merging, 'init', '-b', 'main');
+  git(merging, 'config', 'user.email', 'test@dsh.local');
+  git(merging, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(merging, 'conflict.txt'), 'base\n');
+  git(merging, 'add', '-A');
+  git(merging, 'commit', '-m', 'base');
+  git(merging, 'checkout', '-b', 'side');
+  writeFileSync(join(merging, 'conflict.txt'), 'side\n');
+  git(merging, 'commit', '-am', 'side');
+  git(merging, 'checkout', 'main');
+  writeFileSync(join(merging, 'conflict.txt'), 'main\n');
+  git(merging, 'commit', '-am', 'main');
+  const conflict = await runGit(['merge', 'side'], { cwd: merging });
+  assert.equal(conflict.ok, false);
+  writeFileSync(join(merging, 'conflict.txt'), 'carefully resolved\n');
+  const result = await pullAction(merging);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'merge-in-progress');
+  assert.equal(readFileSync(join(merging, 'conflict.txt'), 'utf8'), 'carefully resolved\n');
+  assert.equal((await runGit(['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], { cwd: merging })).ok, true);
+  git(merging, 'merge', '--abort');
+});
+
+await test('pull.rebase config cannot leave partial rebase state', async () => {
+  const local = join(scratch, 'pull-local');
+  const remote = join(scratch, 'pull-remote.git');
+  const peer = join(scratch, 'pull-peer');
+  mkdirSync(local);
+  git(local, 'init', '-b', 'main');
+  git(local, 'config', 'user.email', 'test@dsh.local');
+  git(local, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(local, 'conflict.txt'), 'base\n');
+  git(local, 'add', '-A');
+  git(local, 'commit', '-m', 'base');
+  git(scratch, 'clone', '--bare', local, remote);
+  git(local, 'remote', 'add', 'origin', remote);
+  git(local, 'push', '-u', 'origin', 'main');
+  git(scratch, 'clone', remote, peer);
+  git(peer, 'config', 'user.email', 'peer@dsh.local');
+  git(peer, 'config', 'user.name', 'Peer');
+  writeFileSync(join(peer, 'conflict.txt'), 'remote\n');
+  git(peer, 'commit', '-am', 'remote');
+  git(peer, 'push');
+  writeFileSync(join(local, 'conflict.txt'), 'local\n');
+  git(local, 'commit', '-am', 'local');
+  git(local, 'config', 'pull.rebase', 'true');
+  const result = await pullAction(local);
+  assert.equal(result.ok, false);
+  assert.equal(result.partial, undefined, JSON.stringify(result));
+  assert.equal(readFileSync(join(local, 'conflict.txt'), 'utf8'), 'local\n');
+  assert.equal(git(local, 'status', '--porcelain').trim(), '');
+  assert.equal(existsSync(join(local, '.git', 'rebase-merge')), false);
+  assert.equal(existsSync(join(local, '.git', 'rebase-apply')), false);
 });
 
 let wt1;
@@ -349,8 +575,10 @@ await test('diffStat + porcelain + computeDiff (uncommitted)', async () => {
   writeFileSync(join(wt1.path, 'a.txt'), 'alpha\nbeta\ngamma\n');
   writeFileSync(join(wt1.path, 'new.txt'), 'fresh\nfile\n');
   const status = await porcelainStatus(wt1.path);
+  assert.equal(status.ok, true);
   assert.equal(status.dirty, true);
   const stat = await diffStat(wt1.path, 'main');
+  assert.equal(stat.ok, true);
   assert.equal(stat.additions, 3); // 1 modified line + 2 untracked lines
   assert.equal(stat.deletions, 0);
   const diff = await computeDiff(wt1.path, { mode: 'uncommitted' });
@@ -370,6 +598,7 @@ await test('commitAction + aheadBehind + base diff + commitDiff', async () => {
   const r = await commitAction(wt1.path, { message: 'wip: gamma + new' });
   assert.equal(r.ok, true, JSON.stringify(r));
   const ab = await aheadBehind(wt1.path, 'main');
+  assert.equal(ab.ok, true);
   assert.equal(ab.ahead, 1);
   assert.equal(ab.behind, 0);
   const diff = await computeDiff(wt1.path, { mode: 'base' });
@@ -392,6 +621,8 @@ await test('hub snapshotFor + fingerprint + invalidate', async () => {
     assert.equal(snap.aheadBehind.ahead, 1);
     assert.equal(snap.dirty, false);
     assert.equal(snap.diffStat.additions, 3);
+    assert.deepEqual(snap.gitKnown, { head: true, status: true, aheadBehind: true, originDelta: true, diffStat: true });
+    assert.deepEqual(snap.degraded, []);
     assert.equal(snap.forgeAuth, 'no_remote');
     assert.equal(snap.pr, null);
     const neg = await hub.snapshotFor(scratch);
@@ -406,6 +637,28 @@ await test('hub snapshotFor + fingerprint + invalidate', async () => {
     git(wt1.path, 'checkout', '--', 'b.txt');
   } finally {
     await hub.dispose();
+  }
+});
+
+await test('hub falls back to immutable base when its branch name disappears', async () => {
+  const orphanedBase = await createWorktree({ repoRoot: repo, base: 'main', intent: 'branch-off', branchName: 'orphaned-base' });
+  writeFileSync(join(orphanedBase.path, 'base-fallback.txt'), 'task\n');
+  git(orphanedBase.path, 'add', '-A');
+  git(orphanedBase.path, 'commit', '-m', 'task commit');
+  const metadata = await readMetadata(orphanedBase.path);
+  git(repo, 'branch', '-m', 'main', 'relocated-main');
+  const hub = createGitStateHub({ emit: () => {} });
+  try {
+    const snapshot = await hub.snapshotFor(orphanedBase.path);
+    assert.equal(snapshot.baseRefName, 'main');
+    assert.equal(snapshot.baseRef, metadata.baseRef);
+    assert.equal(snapshot.gitKnown.aheadBehind, true);
+    assert.equal(snapshot.aheadBehind.ahead, 1);
+    assert.ok(snapshot.diffStat.additions >= 1);
+  } finally {
+    await hub.dispose();
+    git(repo, 'branch', '-m', 'relocated-main', 'main');
+    await archiveWorktree(orphanedBase.path, { force: true });
   }
 });
 
@@ -426,6 +679,8 @@ await test('action ladder (synthetic snapshots)', async () => {
   assert.equal(ladder.find((e) => e.id === 'push').disabled, true);
   assert.equal(ladder.find((e) => e.id === 'push').reasonKey, 'actions.disabled.agentRunning');
   assert.equal(ladder.find((e) => e.id === 'fetch').disabled, false);
+  ladder = buildActionLadder({ ...clean, dirty: true });
+  assert.equal(ladder.find((entry) => entry.id === 'pull').disabled, true, 'dirty state cannot offer pull');
   // open PR promotes mergePr
   const withPr = { ...clean, pr: { number: 7, state: 'open', url: 'https://x/7', isDraft: false, mergeable: 'MERGEABLE', checks: { status: 'success', completed: 3, total: 3 } } };
   ladder = buildActionLadder(withPr);
@@ -433,6 +688,23 @@ await test('action ladder (synthetic snapshots)', async () => {
   assert.equal(ids[0], 'pull');
   assert.ok(ids.includes('mergePr'));
   assert.ok(!ids.includes('createPr'));
+
+  const unknown = {
+    ...clean,
+    dirty: false,
+    gitKnown: { head: false, status: false, aheadBehind: false, originDelta: false, diffStat: false },
+  };
+  ladder = buildActionLadder(unknown);
+  for (const id of ['commit', 'discard', 'pull', 'push', 'mergeToBase', 'updateFromBase', 'archive']) {
+    assert.equal(ladder.find((entry) => entry.id === id)?.disabled, true, `${id} fails closed on unknown Git state`);
+  }
+  assert.equal(ladder.some((entry) => entry.id === 'createPr'), false, 'unknown ahead state cannot offer create PR');
+  const revisionUnknown = {
+    ...clean,
+    gitKnown: { head: true, status: true, aheadBehind: false, originDelta: true, diffStat: true },
+  };
+  ladder = buildActionLadder(revisionUnknown);
+  assert.equal(ladder.find((entry) => entry.id === 'archive').disabled, true, 'archive requires a known revision comparison');
 });
 
 await test('archive guards + archive', async () => {
@@ -447,6 +719,53 @@ await test('archive guards + archive', async () => {
   const notManaged = await archiveWorktree(repo, { force: true });
   assert.equal(notManaged.ok, false);
   assert.equal(notManaged.reason, 'not-managed');
+});
+
+await test('archive keeps worktree when a safety revision is unknown', async () => {
+  const guarded = await createWorktree({ repoRoot: repo, base: 'main', intent: 'branch-off', branchName: 'guarded-archive' });
+  await patchMetadata(guarded.path, (metadata) => ({ ...metadata, baseRef: 'refs/heads/definitely-missing' }));
+  const refused = await archiveWorktree(guarded.path, {});
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'inspect-failed');
+  assert.equal(refused.stage, 'unpushed');
+  assert.equal(existsSync(guarded.path), true, 'unknown safety state preserves the directory');
+  const forced = await archiveWorktree(guarded.path, { force: true });
+  assert.equal(forced.ok, true, JSON.stringify(forced));
+});
+
+await test('archive reports locked worktree removal instead of false success', async () => {
+  const locked = await createWorktree({ repoRoot: repo, base: 'main', intent: 'branch-off', branchName: 'locked-archive' });
+  git(repo, 'worktree', 'lock', locked.path);
+  const refused = await archiveWorktree(locked.path, { force: true });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'teardown-failed');
+  assert.equal(refused.stage, 'worktree-remove');
+  assert.equal(existsSync(locked.path), true);
+  git(repo, 'worktree', 'unlock', locked.path);
+  const removed = await archiveWorktree(locked.path, { force: true });
+  assert.equal(removed.ok, true, JSON.stringify(removed));
+});
+
+await test('non-force archive closes the inspect/remove race', async () => {
+  const raced = await createWorktree({ repoRoot: repo, base: 'main', intent: 'branch-off', branchName: 'raced-archive' });
+  const wrapperDir = join(scratch, 'git-race-wrapper');
+  mkdirSync(wrapperDir);
+  const wrapper = join(wrapperDir, 'git');
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = remove ]; then printf late > "$3/late.txt"; fi\nexec "${realGit}" "$@"\n`);
+  chmodSync(wrapper, 0o755);
+  const originalPath = process.env.PATH;
+  try {
+    process.env.PATH = `${wrapperDir}:${originalPath}`;
+    const refused = await archiveWorktree(raced.path, {});
+    assert.equal(refused.ok, false);
+    assert.equal(refused.stage, 'worktree-remove');
+    assert.equal(existsSync(join(raced.path, 'late.txt')), true, 'late data survives the refused remove');
+  } finally {
+    process.env.PATH = originalPath;
+  }
+  const removed = await archiveWorktree(raced.path, { force: true });
+  assert.equal(removed.ok, true, JSON.stringify(removed));
 });
 
 /* ---------------- PR checkout (the forge's refs/pull/<N>/head) ---------------- */
@@ -839,6 +1158,9 @@ await test('api routes over real HTTP', async () => {
     assert.equal(commits.commits.length, 1);
     assert.equal(commits.commits[0].subject, 'wip: gamma + new');
     assert.equal(commits.commits[0].unpushed, true); // no remote → unpushed
+    const missingCommits = await get(`/commits?cwd=${encodeURIComponent(wt1.path)}&base=refs%2Fheads%2Fdefinitely-missing`);
+    assert.equal(missingCommits.ok, false);
+    assert.equal(missingCommits.stage, 'commits');
 
     const actions = await get(`/actions?cwd=${encodeURIComponent(wt1.path)}`);
     assert.ok(actions.ladder.some((e) => e.id === 'commit' && !e.disabled));
@@ -1216,7 +1538,8 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   const wsEntities = [];
   const registryMock = {
     list: () => wsEntities.slice(),
-    delete: (id) => {
+    delete: async (id) => {
+      await new Promise((resolveDelete) => setTimeout(resolveDelete, 5));
       deleted.push(id);
       return true;
     },
@@ -1235,17 +1558,22 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
 
   const wtClean = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'clean-sweep-0001' });
   const wtDirty = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'dirty-sweep-0002' });
+  const wtUnknown = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'unknown-sweep-0003' });
+  await patchMetadata(wtUnknown.path, (metadata) => ({ ...metadata, baseRef: 'refs/heads/definitely-missing' }));
   writeFileSync(join(wtDirty.path, 'junk.txt'), 'x\n');
   wsEntities.push(
     { path: wtClean.path, workspaceId: 'ws-clean-sweep-0001' },
     { path: wtDirty.path, workspaceId: 'ws-dirty-sweep-0002' },
+    { path: wtUnknown.path, workspaceId: 'ws-unknown-sweep-0003' },
   );
 
   const dry = await cleanup({ dryRun: true });
   assert.equal(dry.ok, true, JSON.stringify(dry));
   assert.ok(dry.archived.some((a) => a.path === wtClean.path && a.dryRun === true));
   assert.ok(dry.skipped.some((s) => s.path === wtDirty.path && s.reason === 'dirty'));
+  assert.ok(dry.errors.some((entry) => entry.path === wtUnknown.path && /ahead-behind/.test(entry.message)), JSON.stringify(dry.errors));
   assert.ok(existsSync(wtClean.path), 'dry run must not remove anything');
+  assert.ok(existsSync(wtUnknown.path), 'unknown safety state is fail-closed even in discovery');
 
   const live = await cleanup({});
   assert.ok(live.archived.some((a) => a.path === wtClean.path && !a.dryRun), JSON.stringify(live));
@@ -1253,6 +1581,8 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   assert.ok(!existsSync(wtClean.path), 'archived worktree dir removed');
   assert.ok(deleted.includes('ws-clean-sweep-0001'), JSON.stringify(deleted));
   assert.ok(existsSync(wtDirty.path), 'dirty worktree untouched');
+  assert.ok(existsSync(wtUnknown.path), 'failed revision inspection must preserve worktree');
+  assert.ok(!deleted.includes('ws-unknown-sweep-0003'), 'failed inspection must preserve registry row');
   // wt1 (committed + unpushed) must never be swept
   assert.ok(live.skipped.some((s) => s.path === wt1.path), 'committed worktree guarded');
 
@@ -1261,7 +1591,7 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   wsEntities.push({ path: wtSession.path, workspaceId: 'ws-session-sweep-0003' });
   const guarded = await createCleanup({
     get(name) {
-      if (name === 'sessions') return sessionsMock([wtSession.path]);
+      if (name === 'sessions') return { list: () => [{ id: 'live-host-session', header: { cwd: wtSession.path }, seq: 1 }] };
       if (name === 'workspaceRegistry') return registryMock;
       return undefined;
     },
@@ -1280,6 +1610,7 @@ await test('cleanup sweep: dry-run, guards, archive + workspace delete', async (
   assert.ok(!existsSync(wtSession.path));
 
   await archiveWorktree(wtDirty.path, { force: true });
+  await archiveWorktree(wtUnknown.path, { force: true });
 });
 
 await test('cleanup abandoned sweep: blank+old only', async () => {
@@ -1289,14 +1620,23 @@ await test('cleanup abandoned sweep: blank+old only', async () => {
   const wsEntities = [];
   const registryMock = {
     list: () => wsEntities.slice(),
-    delete: (id) => {
+    delete: async (id) => {
+      await new Promise((resolveDelete) => setTimeout(resolveDelete, 5));
       deleted.push(id);
       return true;
     },
   };
   const mkCtx = (byId) => ({
     get(name) {
-      if (name === 'sessions') return { list: () => ({ ids: Object.keys(byId), byId }) };
+      if (name === 'sessions') {
+        return {
+          list: () => Object.entries(byId).map(([id, summary]) => ({
+            id,
+            header: summary.header,
+            seq: summary.blank ? 0 : 1,
+          })),
+        };
+      }
       if (name === 'workspaceRegistry') return registryMock;
       return undefined;
     },

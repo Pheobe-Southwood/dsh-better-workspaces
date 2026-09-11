@@ -702,6 +702,16 @@ assert.equal(
   'diff',
   'a clean, pushed tree keeps the pill with the bare page name',
 );
+const staleSnapshot = {
+  dirty: true,
+  changedFileCount: 4,
+  diffStat: { additions: 9, deletions: 3 },
+  upstream: { ahead: 2 },
+  gitKnown: { head: false, status: false, aheadBehind: false, originDelta: false, diffStat: false },
+};
+assert.equal(label(staleSnapshot).children[0], 'diff', 'stale Git facts never masquerade as current pill facts');
+assert.equal(T.snapshotMutationKnown(staleSnapshot), false, 'stale head/status cannot expose direct commit controls');
+assert.equal(T.snapshotMutationKnown({ dirty: true }), true, 'legacy snapshots remain readable');
 
 // new picker/editor dict keys
 assert.equal(dictionaries.dicts.zh['hero.localSuffix'], '（本地）');
