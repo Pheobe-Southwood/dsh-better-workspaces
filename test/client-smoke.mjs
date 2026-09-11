@@ -29,7 +29,7 @@ try {
     useEffect: () => {},
     useRef: (value) => ({ current: value }),
     useCallback: (fn) => fn,
-    useSyncExternalStore: () => null,
+    useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
     Fragment: Symbol('Fragment'),
   };
   const stubReactDomClient = { createRoot: () => ({ render() {}, unmount() {} }) };
@@ -222,6 +222,82 @@ assert.deepEqual(forgeSource.lexicon(), [], 'nothing is attachable until somethi
 assert.equal(await forgeSource.codec.serialize('7', { aborted: false }).then(() => 'no', () => 'threw'), 'threw',
   'a ref without a repository fails loudly instead of expanding to nothing');
 assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
+
+/* ---------------- the composer control actually MOUNTS ---------------- */
+/* ADR 0009: registering the control is not the same as it rendering. The
+   first cut called `props.useInput()` with no argument, but the slot's
+   snapshot hook is `<S>(sel, eq?) => S` — the selector is REQUIRED, so the
+   component threw inside render and React unmounted it while its registration
+   stayed in the slot table (the live page showed `active: false` and no DOM).
+   This mounts it for real and drives every slot hook, so any hook signature
+   drift fails here instead of silently in the browser. */
+{
+  let reactDomServer = null;
+  try {
+    reactDomServer = runtimeRequire('react-dom/server');
+  } catch {
+    // react-dom's server entry is not resolvable here: fall back to calling the
+    // component directly with faithful hook stubs. That still runs the whole
+    // body (and therefore every hook call) — it only skips React's own
+    // reconciliation, which is not what this guard is about.
+    reactDomServer = null;
+  }
+  const { ForgeAttachControl } = mod.__bwTest;
+  assert.equal(typeof ForgeAttachControl, 'function', 'the control is exported for this suite');
+  // the control asks the session list for its cwd and renders nothing without
+  // one (that guard is deliberate), so give the mock a session that has one
+  const liveSnapshot = ctx.sessions.list.getSnapshot();
+  ctx.sessions.list.getSnapshot = () => ({
+    ...liveSnapshot,
+    byId: { ...liveSnapshot.byId, 's-1': { cwd: '/tmp' } },
+  });
+  const hooks = [];
+  const useInput = (selector) => {
+    hooks.push(['useInput', typeof selector]);
+    assert.equal(typeof selector, 'function', 'useInput needs its required selector');
+    return selector({ draft: 'hello', draftRev: 3, occurrences: [] });
+  };
+  const props = {
+    sessionId: 's-1',
+    useInput,
+    // the framework hands the session-scope actions alongside the hooks
+    inputActions: { setDraft() {} },
+  };
+  const tree = reactDomServer === null
+    ? ForgeAttachControl(props)
+    : reactDomServer.renderToStaticMarkup(runtimeRequire('react').createElement(ForgeAttachControl, props));
+  assert.deepEqual(hooks, [['useInput', 'function']], 'the control reads the draft through the slot hook');
+  // walk the element tree the control returned, so the assertion holds for both
+  // the rendered string and the direct call
+  const seen = [];
+  const types = [];
+  const walk = (node) => {
+    if (node === null || node === undefined || typeof node === 'string' || typeof node === 'number') return;
+    if (Array.isArray(node)) { for (const child of node) walk(child); return; }
+    if (typeof node === 'object') {
+      // a child element with no props of its own (the icon glyph) still counts
+      if (typeof node.type === 'string' || typeof node.type === 'function') types.push(node.type);
+      const nodeProps = node.props ?? {};
+      if (typeof nodeProps.className === 'string') seen.push(nodeProps.className);
+      if (typeof nodeProps['aria-label'] === 'string') seen.push(nodeProps['aria-label']);
+      walk(node.children);
+      walk(nodeProps.children);
+    }
+  };
+  walk(tree);
+  const flat = `${String(tree)} ${seen.join(' ')}`;
+  assert.match(flat, /dsh-bw-forge/, 'the control returns its wrapper element');
+  assert.match(flat, /dsh-bw-forge-btn/, 'the forge button is in the returned tree');
+  assert.match(flat, /添加 issue 或 PR/, 'and carries its localized aria-label');
+  assert.ok(
+    types.filter((type) => typeof type === 'function').length >= 1,
+    'the GitHub mark glyph component is part of the subtree',
+  );
+  assert.ok(
+    types.includes('button'),
+    'the control renders a real button element',
+  );
+}
 
 /* ---------------- diff as an official right-Sidebar page type ---------------- */
 assert.equal(tabTypes.length, 1, 'exactly one right-Sidebar tab type');
