@@ -1,6 +1,6 @@
 # dsh-better-workspaces 上下文
 
-DSH Web GUI 的 git 增强插件：为新会话做 worktree 预备、在侧栏呈现每个会话的 git 徽章、并在官方右侧栏提供一个 diff 页签。本文件是项目领域语言的术语表。
+DSH Web GUI 的 git 增强插件：为新会话做 worktree 预备、在侧栏呈现每个会话的 git 徽章、在官方右侧栏提供一个 diff 页签，并让会话可以直接引用 forge 上的 issue 与 PR。本文件是项目领域语言的术语表。
 
 ## 会话与工作区
 
@@ -13,11 +13,11 @@ _Avoid_: 项目、目录
 _Avoid_: 工作路径
 
 **预备区（hero）**：
-空白会话在首条消息之前的暂存状态：在此选定工作区、worktree 策略与 agent 预设。worktree 下拉仅出现在这里；选定「新建 worktree」与基分支只是暂存意图，不产生任何副作用。
+空白会话在首条消息之前的暂存状态：在此选定工作区、worktree 策略与 agent 预设。worktree 下拉仅出现在这里；选定模式本身不产生任何副作用，选定基分支或 PR 行则以创建收尾（见择基创建）。
 _Avoid_: 首页、欢迎页
 
 **择基创建（create-on-arm）**：
-暂存态下选定基分支（或确认显式分支名、或点「立即创建」）即创建 worktree 与工作区并跳转新会话——会话诞生于 worktree 内，首轮工具即落在新目录（会话 cwd 创建后不可迁移，见 ADR 0004 Amendment 2）。打开菜单与浏览分支零副作用；被遗弃的产物由 abandoned 清扫回收。
+暂存态下选定基分支、选定 PR 行（见 PR 检出）、确认显式分支名、或点「立即创建」即创建 worktree 与工作区并跳转新会话——会话诞生于 worktree 内，首轮工具即落在新目录（会话 cwd 创建后不可迁移，见 ADR 0004 Amendment 2）。打开菜单与浏览分支零副作用；被遗弃的产物由 abandoned 清扫回收。
 _Avoid_: 首送创建、点击即创建
 
 **本地检出（「本地」）**：
@@ -29,12 +29,20 @@ _Avoid_: 主目录、原目录
 _Avoid_: 临时目录、副本
 
 **基线分支（base branch）**：
-托管 worktree 被切出时所依据的精确 ref，记录在元数据里；是已提交 diff 与超前/落后的比较基线。无记录时回退默认分支。
+托管 worktree 的比较基线，记录在元数据里；是已提交 diff 与超前/落后的比较对象。切分支创建时记的是所依据的精确 ref，PR 检出的 worktree 记的是该 PR 自身的目标分支。无记录时回退默认分支。
 _Avoid_: 上游（那是另一个概念）
 
 **基分支选择**：
-hero 分支下拉的语义：所选分支只作为切出的基（base），「新建 worktree」永远切出一个新分支，从不检出既有分支（paseo 语义）。
+hero 下拉的语义按行一分为二：分支行只作为切出的基（base），「新建 worktree」切出一个新分支、从不检出既有分支（paseo 语义）；PR 行不是基，而是检出目标（见 PR 检出）。两种选择都以创建收尾（见择基创建）。
 _Avoid_: 分支切换
+
+**PR 检出（pr-checkout）**：
+一种 worktree 创建意图：不切新分支，而是把某个 PR 的 head 取到本地检出（paseo 的 checkout-change-request）。本地分支名对同仓 PR 就是该 PR 的 head 分支名，对 fork PR 是 `<owner>/<分支名>`，被占用时自动加后缀。该 worktree 的基是这个 PR 自己的目标分支，且没有占位名，因此从不参与自动重命名。
+_Avoid_: PR 分支、合并 PR
+
+**PR 上游跟踪**：
+PR 检出 worktree 的上游规则：同仓 PR 的本地分支跟踪 `origin/<head 分支名>`；fork PR 一律不设上游——那是贡献者的分支，不归我们推送，指向它会让「未推送」计数与 pull/push 阶梯瞄准错分支。不设上游时这些状态显式为「无」，而不是拿同名远端分支凑数。
+_Avoid_: 上游分支（歧义：见上游）
 
 **worktree 模式菜单**：
 hero 行上「本地 / 新建 worktree」二选一的下拉（ADR 0002）：选中「新建 worktree」进入暂存态并展开基分支选择器，重新选中「本地」退出暂存态、不产生任何副作用；触发器标签始终显示当前模式。
@@ -45,11 +53,11 @@ _Avoid_: 工作目录下拉（那是原生控件）
 _Avoid_: 临时分支、默认分支
 
 **自动重命名（auto-rename）**：
-worktree 会话首条真实用户消息触发的一次性 LLM 辅助命名：同一次调用产出 {会话标题, 分支 slug}（paseo 契约），分支经 git branch -m 重命名（如 fix-login-bug），标题经 sessionTitle.rename 应用（取代原生自动标题）。守护链：托管 worktree + autoName 为 pending + 当前分支仍等于占位名 + 非子会话；用户显式命名的分支（ineligible）、已手动改名的分支、任何生成失败都保留占位名且不再重试（一次性 attempted）。重命名成功经 hub 失效由 SSE 推送，徽章与 hero 秒级刷新。
+worktree 会话首条真实用户消息触发的一次性 LLM 辅助命名：同一次调用产出 {会话标题, 分支 slug}（paseo 契约），分支经 git branch -m 重命名（如 fix-login-bug），标题经 sessionTitle.rename 应用（取代原生自动标题）。守护链：托管 worktree + autoName 为 pending + 当前分支仍等于占位名 + 非子会话；用户显式命名的分支（ineligible）、已手动改名的分支、任何生成失败都保留占位名且不再重试（一次性 attempted）。重命名成功经 hub 失效由 SSE 推送，徽章与 hero 秒级刷新。PR 检出的 worktree 不写占位名，从不进入这条链。
 _Avoid_: 智能命名、自动分支
 
 **上游（upstream）**：
-当前分支配置的远端跟踪分支；决定「未推送」计数与 pull/push 目标。
+当前分支配置的远端跟踪分支；决定「未推送」计数与 pull/push 目标。PR 检出的情形见 PR 上游跟踪。
 _Avoid_: 基线、远端
 
 **默认分支**：
@@ -84,7 +92,15 @@ PR 的 CI 状态汇总，fail-fast 折叠：任一 failure→失败；否则任�
 open（绿）/ merged（紫）/ closed（红）三态；序号自 PR URL 解析。
 
 **Forge**：
-通过其官方 CLI 访问的代码托管平台（GitHub 经 gh）；认证状态即 CLI 登录状态，本插件不持有 token。
+通过其官方 CLI 访问的代码托管平台（GitHub 经 gh）；认证状态即 CLI 登录状态，本插件不持有 token。既是 PR/checks 徽章的数据源，也是 forge 选择器与 PR 检出的数据源。
+
+**forge 点位（forge item）**：
+一个可被引用的 issue 或 PR 条目：选择器里的一行、hero 基列表里的一行、引用 chip 指向的对象都是它。编号在 issue 与 PR 之间共享，同一个编号只对应其中一个。
+_Avoid_: 卡片、条目
+
+**forge 认证状态（authState）**：
+读取 forge 数据时的状态分档：已登录（正常）、未装 gh CLI、gh 未登录、仓库没有可用的 GitHub 远端、gh 调用失败。插件不代管认证，只把状态说清楚，缺 forge 时其余功能照常。
+_Avoid_: 登录状态
 
 **git 快照**：
 按工作区根目录折叠出的最小 git 状态（分支、脏、超前/落后、DiffStat、PR、checks），供徽章行与各视图消费；指纹相同的快照不重复下发。
@@ -98,6 +114,18 @@ _Avoid_: 状态栏、标签行
 **diff pill**：
 输入框上方的 DiffStat 胶囊；点击在官方右侧栏打开（或展开并定位到）diff 页签；无任何变更时仍显示，标签退化为「diff」。
 _Avoid_: diff 按钮
+
+**forge 控件**：
+composer 附着控件行里排在官方「+」（命令菜单）与回形针（文件选择）之后的 GitHub 圆标按钮：点开 forge 选择器。官方两个原生附着控件保持原样，不被合并、替换或改写。
+_Avoid_: 附件按钮
+
+**forge 选择器（picker）**：
+forge 控件打开的居中对话框：一页 issue 与 PR（各取一页，合并后按更新时间新→旧），带一个本地筛选框；选中一行即挂上引用 chip 并关闭。没有服务端搜索，也没有翻页。
+_Avoid_: 搜索面板
+
+**引用 chip**：
+草稿里的一个 forge 点位引用：界面上只占一个「PR #N 标题」或「Issue #N 标题」样式的小片，发送时展开为完整文段（标题、链接、正文，PR 另带基线与 head）交给模型。标签是挂上那一刻算好的缓存，正文与元数据在发送时才重新取。
+_Avoid_: 附件、提及
 
 **diff 页签**：
 官方右侧栏里的一个 page 类型（kind `bw-diff`），并注册一个 guide 条目：右侧栏「开始」页上以「代码变更」卡片与官方「工作区文件」并列。因 guide 条目不再唯一，没有历史布局的会话首次打开右侧栏会落在「开始」选择页；无需选页时仍可只走 diff pill（取舍见 ADR 0006 Amendment 1）。

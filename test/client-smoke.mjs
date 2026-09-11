@@ -73,6 +73,14 @@ const sidebarRightTabs = {
   },
 };
 const sidebarRight = { openTab() {} };
+/* The trigger pipeline: the forge reference codec registers here. */
+const triggerSources = [];
+const inputTriggers = {
+  registerSource(source) {
+    triggerSources.push(source);
+    return () => {};
+  },
+};
 
 const ctx = {
   // a hard inject would make `sidebarRightTabs` a ctx property inside the fiber
@@ -88,6 +96,14 @@ const ctx = {
     return undefined;
   },
   inject(deps, callback) {
+    assert.ok(
+      deps.includes('sidebarRightTabs') || deps.includes('inputTriggers'),
+      `unexpected service-gated child fiber: ${deps.join(', ')}`,
+    );
+    if (deps.includes('inputTriggers')) {
+      callback({ ...ctx, inputTriggers });
+      return { dispose() {} };
+    }
     assert.ok(
       deps.includes('sidebarRightTabs'),
       'the diff page waits for the right Sidebar tab registry instead of injecting it',
@@ -153,11 +169,59 @@ for (const r of registrations.filter((x) => x.component)) {
   assert.equal(typeof r.component, 'function', 'component is a function');
 }
 // every remaining descriptor carries an inject(sessionId) that yields {sessionId}
-for (const d of docks) {
+for (const d of [...docks, ...descriptors.filter((x) => x.name === 'conversation.input.left')]) {
   assert.equal(typeof d.inject, 'function');
   assert.deepEqual(d.inject('s-1'), { sessionId: 's-1' });
   assert.equal(d.locale, 'better-workspaces');
 }
+
+/* ---------------- the composer's forge (issue / PR) control ---------------- */
+/* ADR 0008: the two native composer controls are hardcoded in the official
+   InputBar and are deliberately untouched; this is the ONLY composer addition,
+   and it lands in the one additive slot (which renders after them). */
+const leftSlots = descriptors.filter((d) => d.name === 'conversation.input.left');
+assert.equal(leftSlots.length, 1, 'exactly one additive composer control');
+assert.equal(leftSlots[0].id, 'forge-issue-pr');
+assert.equal(leftSlots[0].order, 200);
+/* the reference source is what makes a chip carry the full paseo text to the
+   model while the composer shows only its label — it must ride the plugin's
+   own lifetime, or an inserted chip would block every send */
+assert.equal(triggerSources.length, 1, 'the forge reference source is registered');
+const forgeSource = triggerSources[0];
+assert.equal(forgeSource.trigger, '@');
+assert.equal(forgeSource.name, 'better-workspaces-forge');
+assert.equal(typeof forgeSource.codec, 'object', 'a codec is what turns a chip into model text');
+assert.equal(typeof forgeSource.codec.serialize, 'function');
+assert.equal(forgeSource.codec.clipboardText('7'), '@7');
+/* NOT `candidates === undefined`: the controller's roster loop calls
+   `candidates(...)` synchronously on every `@` hit, so an omitted hook throws
+   inside the loop and every source ordered after this one stops answering.
+   "No candidates of my own" is an empty list, and it must still be a promise. */
+assert.equal(typeof forgeSource.candidates, 'function', 'the @ roster loop calls this hook unconditionally');
+assert.deepEqual(await forgeSource.candidates({}, { query: '' }), [], 'this source never contributes @ rows');
+/* Replay the controller's roster loop shape: EVERY registered source must
+   answer synchronously without throwing. This is the assertion that fails when
+   a hook is merely omitted (the real menu then loses every source after it),
+   so it must not be replaced by a `=== undefined` check. */
+for (const source of triggerSources) {
+  const pending = source.candidates({ sessionId: 's-1' }, { query: '', position: 0, drilled: false });
+  assert.equal(typeof pending.then, 'function', `${source.name}: candidates must return a promise`);
+  assert.ok(Array.isArray(await pending), `${source.name}: candidates must resolve to a list`);
+}
+assert.equal(typeof forgeSource.lexicon, 'function', 'the lexicon decorates a persisted @N draft');
+assert.ok(Array.isArray(forgeSource.lexicon()), 'lexicon answers a roll, never undefined');
+/* A roll that never changes after warm would leave a freshly attached ref
+   undecorated, so the source must publish its invalidation channel too. */
+assert.equal(typeof forgeSource.subscribeLexicon, 'function', 'the lexicon roll announces its changes');
+let lexiconPings = 0;
+const offLexicon = forgeSource.subscribeLexicon({ sessionId: 's-1' }, () => { lexiconPings += 1; });
+assert.equal(typeof offLexicon, 'function', 'subscribing the roll returns its disposer');
+offLexicon();
+assert.equal(lexiconPings, 0, 'nothing is announced before anything is attached');
+assert.deepEqual(forgeSource.lexicon(), [], 'nothing is attachable until something was attached');
+assert.equal(await forgeSource.codec.serialize('7', { aborted: false }).then(() => 'no', () => 'threw'), 'threw',
+  'a ref without a repository fails loudly instead of expanding to nothing');
+assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
 
 /* ---------------- diff as an official right-Sidebar page type ---------------- */
 assert.equal(tabTypes.length, 1, 'exactly one right-Sidebar tab type');

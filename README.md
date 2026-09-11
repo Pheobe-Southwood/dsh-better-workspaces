@@ -29,10 +29,22 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    titles the session (hosts after restart), and the workspace title follows
    as `<source> · <session title>` — only ever for the workspace owning the
    current session's cwd, since every git detection result is tagged with the
-   cwd it was resolved for. Inside a worktree workspace the hero
-   control hides entirely, and the sidebar row trades its folder icon for a
-   branch icon. Abandoned staging leftovers are swept automatically
-   (boot + hourly) or via `POST /worktrees/cleanup`.
+   cwd it was resolved for. **The same picker also lists open pull requests**,
+   after a rule: PR rows read `#N title` with a `→ base` hint and a `fork`
+   marker, and picking one checks the PR's HEAD out instead of cutting a branch
+   (paseo's `checkout-change-request`). The head comes from the forge's
+   `refs/pull/<N>/head` — the only ref a fork's contribution has — the local
+   branch is `<headRef>`, or `<owner>/<headRef>` for a fork, and the PR's own
+   base branch becomes the diff baseline rather than whatever the picker was
+   pointed at. A same-repo PR tracks `origin/<headRef>` (the tracking ref is
+   materialized from the fetched SHA, so `@{upstream}` resolves even when the
+   contributor's branch was never pushed); a fork PR deliberately gets no
+   upstream, so the unpushed count and the pull/push ladder stay explicit
+   instead of aiming at the wrong branch. PR worktrees carry no placeholder
+   branch and are never renamed by the first message. Inside a worktree
+   workspace the hero control hides entirely, and the sidebar row trades its
+   folder icon for a branch icon. Abandoned staging leftovers are swept
+   automatically (boot + hourly) or via `POST /worktrees/cleanup`.
 2. **Sidebar git badges** — session rows stretch vertically; below the title:
    `branch · #PR (green open / purple merged / red closed) · checks pie ring ·
    +N/−N · ↑a↓b (only when non-zero)`. Missing items are omitted.
@@ -70,6 +82,25 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    compare-and-swap (concurrent on-disk change → 409 conflict + reload,
    never a silent overwrite; containment/size/binary guards, atomic
    tmp+rename write).
+5. **Composer GitHub control** — a GitHub-mark button beside the composer's
+   native `+` (commands) and paperclip (files). Those two are hardcoded in the
+   official InputBar and are left untouched; the plugin only adds a third
+   control in the one additive slot of that row (ADR 0008). It opens a centered
+   picker of one `gh` page of open PRs + issues (20 per kind, newest first,
+   local filtering only — no server-side search), and picking a row attaches a
+   **reference chip**: the draft shows one small `PR #N title` / `Issue #N title`
+   block, while the chip's codec expands it at submit time into the full text
+   the model receives (`GitHub PR #N: title`, URL, `Base`/`Head`, body; issues
+   without the base/head lines). The chip rides the official `@`
+   reference-source seam — a codec plus a lexicon limited to the references this
+   session actually attached, and no candidate list of its own (the picker is
+   its only door) — and the source stays registered for the
+   plugin's lifetime, because a chip whose source has no serializer makes the
+   send fail loudly instead of silently degrading. If the
+   official `insertReference` revision CAS refuses the write, the plugin
+   appends the plain `@N` token instead, which the decoration scan still
+   renders as a chip. Missing `gh` / not signed in / no usable remote are
+   surfaced in the picker rather than handled.
 
 ## Architecture
 
@@ -77,16 +108,25 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
   `cleanup.js`, `forge.js`, `diff.js`, `actions.js`, `state.js`, `api.js`):
   git-CLI primitives behind an 8-way concurrency scheduler; managed worktrees under
   `~/.dsh/worktrees/<8-char base36 sha256(mainRepoRoot)>/<slug>` with
-  `<gitdir>/dsh-worktree/worktree.json` metadata; first-message branch
+  `<gitdir>/dsh-worktree/worktree.json` metadata and three creation intents —
+  `branch-off` (cut from a base), `checkout`, and `pr-checkout` (fetch the
+  forge's `refs/pull/<N>/head` from origin/upstream, create the local branch
+  with `git worktree add -b … --no-track <sha>`, take the PR's own base as the
+  diff baseline, and track `origin/<headRef>` for same-repo PRs only);
+  first-message branch
   auto-rename via `ctx.llm.stream` + `ctx.agentDefaultModel` (both optional —
   absent services keep placeholders; its output budget is sized for a reasoning
   prelude, because a reasoning model spends it before any text exists); snapshot
   hub with fs watchers (1 s debounce, degraded 5 s polling), 180 s background
   fetch and
-  fingerprint-deduped SSE; HTTP+SSE API on the harness webServer under
+  fingerprint-deduped SSE; `forge.js` serves both the batched PR/checks GraphQL
+  and the picker's issue/PR pages (`GET /pulls`, `GET /pull`) through the user's
+  `gh` CLI (30 s cache, never tokens); HTTP+SSE API on the harness webServer under
   `/better-workspaces/api`.
 - **Client** (`lib/client.js`, hand-written `__ModuleLoader__` bundle):
-  slot-registered right-Sidebar diff page + dock pill; DOM injection
+  slot-registered right-Sidebar diff page + dock pill + composer forge control
+  (`conversation.input.left`) with its `@` reference source/codec for issue/PR
+  chips; DOM injection
   (MutationObserver + React portals + anchor self-check with silent
   degradation, ADR 0001) for the hero dropdown and sidebar badges, which have
   no fine-grained slots.
@@ -97,7 +137,8 @@ See `CONTEXT.md` for the glossary and `docs/adr/` for the design records.
 
 Prerequisites: `dsh` ≥ 0.1.5 with the `web` profile, `pnpm` on `PATH`, and
 `git` ≥ 2.31. `gh` (authenticated) is optional — it enables the PR/checks
-features and degrades gracefully when absent.
+features and the composer's issue/PR picker and PR checkout, and degrades
+gracefully when absent.
 
 **One command installs and mounts the plugin** (plain JS, no build step):
 
