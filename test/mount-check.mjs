@@ -147,7 +147,7 @@ for (const withWebServer of [false, true]) {
       }
       if (typeof disposer === 'function') {
         try {
-          disposer();
+          await disposer();
         } catch (e) {
           console.log(`EFFECT DISPOSE FAIL [${entry.label}]\n${e && e.stack ? e.stack : e}`);
           process.exit(1);
