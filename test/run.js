@@ -14,7 +14,7 @@ const scratch = mkdtempSync(join(tmpdir(), 'dsh-bw-test-'));
 process.env.DSH_HOME = join(scratch, 'dshhome');
 mkdirSync(process.env.DSH_HOME, { recursive: true });
 
-const { detectRepo, resolveDefaultBranch, listBranches, currentBranchInfo, diffStat, porcelainStatus, aheadBehind, runGit, listCommits, unpushedShas } = await import('../lib/git.js');
+const { detectRepo, resolveDefaultBranch, listBranches, currentBranchInfo, diffStat, porcelainStatus, aheadBehind, runGit, withPinnedGitEnvironment, listCommits, unpushedShas } = await import('../lib/git.js');
 const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree } = await import('../lib/worktree.js');
 const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
@@ -24,6 +24,7 @@ const { createApi, API_PREFIX } = await import('../lib/api.js');
 const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable, parseGithubRemote, prStatus, prStatusBatch, invalidatePr, createPullRequest, mergePullRequest, disableAutoMerge } = await import('../lib/forge.js');
 const { createCleanupScheduler, createCreationSourceGuard, createExactWorkspaceDelete, createWorkspaceArchiveGuard } = await import('../lib/index.js');
 const { hostMutationCoordinator } = await import('../lib/mutation.js');
+const { createWorkspaceAuthorizer } = await import('../lib/authorize.js');
 
 function git(cwd, ...args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' });
@@ -102,8 +103,25 @@ await test('runGit accepted exits never hide process failures', async () => {
   assert.equal(timedOut.ok, false, 'killed/time-limited processes always fail');
   assert.equal(timedOut.timedOut, true);
 
+  const priorCommonDir = process.env.GIT_COMMON_DIR;
+  process.env.GIT_COMMON_DIR = '/definitely/not/a/git/common/dir';
+  const ambientCommon = await runGit(['rev-parse', '--verify', 'HEAD'], { cwd: repo });
+  if (priorCommonDir === undefined) delete process.env.GIT_COMMON_DIR;
+  else process.env.GIT_COMMON_DIR = priorCommonDir;
+  assert.equal(ambientCommon.ok, true, 'ambient GIT_COMMON_DIR must not retarget repository discovery');
+
   const guarded = await runGit(['rev-parse', '--verify', 'HEAD'], { cwd: repo, parentGuard: true });
   assert.equal(guarded.ok, true, guarded.stderr);
+});
+
+await test('runGit limiter preserves each caller pinned environment', async () => {
+  const blockers = Array.from({ length: 8 }, () => runGit(['-c', 'alias.pause=!sleep .15', 'pause'], { cwd: repo }));
+  const pinned = withPinnedGitEnvironment({ GIT_DIR: join(repo, '.git'), GIT_WORK_TREE: repo }, () =>
+    runGit(['rev-parse', '--show-toplevel'], { cwd: scratch }));
+  const result = await pinned;
+  assert.equal(result.ok, true, result.stderr);
+  assert.equal(result.stdout.trim(), repo);
+  await Promise.all(blockers);
 });
 
 await test('parent-guarded Git cannot outlive a killed Host worker', async () => {
@@ -1003,6 +1021,29 @@ await test('commitAction + aheadBehind + base diff + commitDiff', async () => {
   assert.equal(cd.isMerge, false);
 });
 
+await test('hub supports an authorized root with a separate Git directory', async () => {
+  const work = join(scratch, 'separate-work');
+  const gitDir = join(scratch, 'separate-git');
+  mkdirSync(work);
+  git(scratch, 'init', '--separate-git-dir', gitDir, work);
+  git(work, 'config', 'user.email', 'test@example.com');
+  git(work, 'config', 'user.name', 'Test');
+  writeFileSync(join(work, 'tracked.txt'), 'separate\n');
+  git(work, 'add', 'tracked.txt');
+  git(work, 'commit', '-m', 'separate root');
+  git(work, 'branch', '-M', 'main');
+  const authorizer = createWorkspaceAuthorizer({ workspaceRoots: () => [work] });
+  const hub = createGitStateHub({ authorizeTarget: (cwd) => authorizer.authorize(cwd) });
+  try {
+    const snapshot = await hub.snapshotFor(work, { fresh: true });
+    assert.equal(snapshot.isGit, true);
+    assert.equal(snapshot.branch, 'main');
+    assert.equal(snapshot.repoRoot, work);
+  } finally {
+    await hub.dispose();
+  }
+});
+
 await test('hub snapshotFor + fingerprint + invalidate', async () => {
   const emitted = [];
   const hub = createGitStateHub({ onChange: (s) => emitted.push(s) });
@@ -1114,6 +1155,37 @@ await test('hub background compute drops a revoked Workspace capability', async 
     assert.equal(hub.isKnownGit(wt.path), false);
     assert.equal(emitted.length, emittedBefore);
   } finally {
+    await hub.dispose();
+    await archiveWorktree(wt.path, { force: true });
+  }
+});
+
+await test('hub fences an older authorize result after a concurrent revocation', async () => {
+  const wt = await createWorktree({ repoRoot: repo, intent: 'branch-off', slug: 'hub-auth-inverse' });
+  const identity = statSync(wt.path);
+  const mainIdentity = statSync(repo);
+  const capability = { ok: true, cwd: wt.path, root: wt.path, mainRepoRoot: repo, gitBoundary: 'root', identity: { dev: identity.dev, ino: identity.ino }, mainIdentity: { dev: mainIdentity.dev, ino: mainIdentity.ino } };
+  let deferred = false;
+  const checks = [];
+  const hub = createGitStateHub({
+    authorizeTarget: async () => {
+      if (!deferred) return capability;
+      return new Promise((resolveCheck) => checks.push(resolveCheck));
+    },
+  });
+  try {
+    assert.equal((await hub.snapshotFor(wt.path, { fresh: true })).isGit, true);
+    deferred = true;
+    const older = hub.snapshotFor(wt.path);
+    const revoke = hub.snapshotFor(wt.path);
+    while (checks.length < 2) await new Promise((resolveTurn) => setImmediate(resolveTurn));
+    checks[1]({ ok: false, reason: 'unauthorized' });
+    assert.equal((await revoke).isGit, false);
+    checks[0](capability);
+    assert.equal((await older).isGit, false);
+    assert.equal(hub.isKnownGit(wt.path), false);
+  } finally {
+    for (const resolveCheck of checks) resolveCheck({ ok: false, reason: 'unauthorized' });
     await hub.dispose();
     await archiveWorktree(wt.path, { force: true });
   }
