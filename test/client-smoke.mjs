@@ -664,6 +664,10 @@ assert.deepEqual(
 /* ---------------- first-send interception helpers (pure) ---------------- */
 const T = mod.__bwTest;
 assert.ok(T, '__bwTest helpers exported');
+assert.equal(/blocks\.set\([^\n]+, null\)/.test(source), false,
+  'composer blocks are cleared with undefined; null is still a live crashing block');
+assert.ok(/\.filter\(\(entry\) => entry\.id !== "archive"\)/.test(source),
+  'manual physical archive remains hidden until DSH provides a cross-page retiring lease');
 
 assert.equal(T.failureMessage({ message: 'm' }), 'm');
 assert.equal(T.failureMessage({ ok: false, error: 'cwd required' }), 'cwd required');
@@ -752,6 +756,194 @@ assert.equal(T.liveDetect({ cwd: '/a', value: detectValue }, '/a'), detectValue,
 assert.equal(T.liveDetect({ cwd: '/a', value: detectValue }, '/b'), null, 'a detection never crosses cwd');
 assert.equal(T.liveDetect({ cwd: '/a', value: detectValue }, null), null, 'no cwd → no detection');
 assert.equal(T.liveDetect({ cwd: null, value: detectValue }, '/a'), null, 'untagged detection is unusable');
+
+/* ---------------- request ownership + draft handoff transactions ---------------- */
+const requestOwner = T.createRequestOwner();
+const firstRead = requestOwner.begin('read');
+const unrelated = requestOwner.begin('save');
+const latestRead = requestOwner.begin('read');
+assert.equal(requestOwner.owns(firstRead), false, 'new same-domain request supersedes the prior one');
+assert.equal(requestOwner.owns(unrelated), true, 'independent domains do not cancel each other');
+assert.equal(requestOwner.owns(latestRead), true);
+requestOwner.reset();
+assert.equal(requestOwner.owns(unrelated), false, 'resource reset invalidates every outstanding request');
+assert.equal(requestOwner.owns(latestRead), false);
+const releaseMutation = T.acquireWorkspaceMutation('/workspace/a');
+assert.equal(typeof releaseMutation, 'function');
+assert.equal(T.acquireWorkspaceMutation('/workspace/a'), null, 'same-workspace mutation is synchronously single-flight');
+const releaseOtherMutation = T.acquireWorkspaceMutation('/workspace/b');
+assert.equal(typeof releaseOtherMutation, 'function', 'unrelated workspaces can mutate independently');
+releaseMutation();
+const releaseAgain = T.acquireWorkspaceMutation('/workspace/a');
+assert.equal(typeof releaseAgain, 'function', 'lease is released after settlement');
+releaseAgain();
+releaseOtherMutation();
+
+function draftInput(initial, noop = false, attachmentIds = [], occurrences = []) {
+  let state = { draft: initial, draftRev: 1, phase: 'plain', attachmentIds: [...attachmentIds], occurrences };
+  return {
+    state: { getSnapshot: () => state },
+    setDraft(text) {
+      if (!noop) state = { ...state, draft: text, draftRev: state.draftRev + 1 };
+    },
+    addAttachments(ids) {
+      if (noop) return false;
+      state = { ...state, attachmentIds: [...state.attachmentIds, ...ids] };
+      return true;
+    },
+    setPhase(phase) { state = { ...state, phase }; },
+    removeAttachment(id) {
+      const next = state.attachmentIds.filter((candidate) => candidate !== id);
+      if (next.length === state.attachmentIds.length) return false;
+      state = { ...state, attachmentIds: next };
+      return true;
+    },
+  };
+}
+function draftSessions(source, target, open = () => {}) {
+  const byId = { source, target };
+  const conversation = { input: { for: (scope) => byId[scope.id] } };
+  return {
+    scope: (id) => ({ id, get: (name) => name === 'conversation' ? conversation : undefined }),
+    open,
+  };
+}
+const sourceDraft = draftInput('carry me');
+const targetDraft = draftInput('');
+const opened = [];
+const sessionsForDraft = draftSessions(sourceDraft, targetDraft, (id) => opened.push(id));
+const capturedDraft = T.readSessionDraft(sessionsForDraft, 'source');
+assert.equal(T.sessionsHaveEmptyDrafts(sessionsForDraft, ['target']), true);
+assert.equal(T.sessionsHaveEmptyDrafts(sessionsForDraft, ['source', 'target']), false,
+  'Workspace archive preflight includes sibling session drafts');
+assert.equal(T.transferSessionDraft(sessionsForDraft, 'source', 'target', capturedDraft), true);
+assert.equal(sourceDraft.state.getSnapshot().draft, '');
+assert.equal(targetDraft.state.getSnapshot().draft, 'carry me');
+assert.deepEqual(opened, ['target'], 'target opens only after verified draft transfer');
+
+const changedSource = draftInput('old');
+const changedTarget = draftInput('');
+const changedSessions = draftSessions(changedSource, changedTarget, () => { throw new Error('must not open'); });
+const staleDraft = T.readSessionDraft(changedSessions, 'source');
+changedSource.setDraft('new');
+assert.equal(T.transferSessionDraft(changedSessions, 'source', 'target', staleDraft), false);
+assert.equal(changedSource.state.getSnapshot().draft, 'new', 'draftRev CAS preserves a newer source draft');
+assert.equal(changedTarget.state.getSnapshot().draft, '');
+const claimedSource = draftInput('claim');
+const claimedTarget = draftInput('');
+const claimedSessions = draftSessions(claimedSource, claimedTarget, () => { throw new Error('must not open'); });
+const claimedCapture = T.readSessionDraft(claimedSessions, 'source');
+claimedSource.setPhase('claimed');
+assert.equal(T.transferSessionDraft(claimedSessions, 'source', 'target', claimedCapture), false,
+  'a phase transition fences draft transfer even when text/revision are unchanged');
+
+const detachedSource = draftInput('detached');
+const replacementSource = draftInput('live replacement');
+const detachedTarget = draftInput('');
+let liveSourceInput = detachedSource;
+const detachedConversation = { input: { for: (scope) => scope.id === 'source' ? liveSourceInput : detachedTarget } };
+const detachedSessions = {
+  scope: (id) => ({ id, get: (name) => name === 'conversation' ? detachedConversation : undefined }),
+  open: () => { throw new Error('must not open'); },
+};
+const detachedCapture = T.readSessionDraft(detachedSessions, 'source');
+liveSourceInput = replacementSource;
+assert.equal(T.transferSessionDraft(detachedSessions, 'source', 'target', detachedCapture), false,
+  'a rematerialized live session facade supersedes the captured shell');
+assert.equal(replacementSource.state.getSnapshot().draft, 'live replacement');
+
+const reentrantSource = draftInput('captured');
+const reentrantTarget = draftInput('');
+const originalTargetSetDraft = reentrantTarget.setDraft.bind(reentrantTarget);
+reentrantTarget.setDraft = (text) => {
+  originalTargetSetDraft(text);
+  if (text === 'captured') reentrantSource.setDraft('newer during target write');
+};
+const reentrantSessions = draftSessions(reentrantSource, reentrantTarget, () => { throw new Error('must not open'); });
+assert.equal(T.transferSessionDraft(reentrantSessions, 'source', 'target', T.readSessionDraft(reentrantSessions, 'source')), false);
+assert.equal(reentrantSource.state.getSnapshot().draft, 'newer during target write',
+  'second CAS failure never rolls the source back over a newer draft');
+assert.equal(reentrantTarget.state.getSnapshot().draft, '');
+
+const guardedSource = draftInput('valuable');
+const noopTarget = draftInput('', true);
+const guardedSessions = draftSessions(guardedSource, noopTarget, () => { throw new Error('must not open'); });
+assert.equal(T.transferSessionDraft(guardedSessions, 'source', 'target', T.readSessionDraft(guardedSessions, 'source')), false);
+assert.equal(guardedSource.state.getSnapshot().draft, 'valuable', 'unconfirmed target write never clears source');
+
+const rollbackSource = draftInput('restore');
+const rollbackTarget = draftInput('');
+const rollbackSessions = draftSessions(rollbackSource, rollbackTarget, () => { throw new Error('open failed'); });
+assert.throws(
+  () => T.transferSessionDraft(rollbackSessions, 'source', 'target', T.readSessionDraft(rollbackSessions, 'source')),
+  /open failed/,
+);
+assert.equal(rollbackSource.state.getSnapshot().draft, 'restore');
+assert.equal(rollbackTarget.state.getSnapshot().draft, '');
+
+const attachmentSource = draftInput('', false, ['attachment-1']);
+const attachmentTarget = draftInput('');
+const attachmentRebinds = [];
+const attachmentSessions = draftSessions(attachmentSource, attachmentTarget, (id) => opened.push(id));
+assert.equal(T.transferSessionDraft(
+  attachmentSessions,
+  'source',
+  'target',
+  T.readSessionDraft(attachmentSessions, 'source'),
+  { rebindDraftFiles: (sessionId, ids) => attachmentRebinds.push([sessionId, [...ids]]) },
+), true, 'attachment-only draft is handed off instead of being stranded');
+assert.deepEqual(attachmentSource.state.getSnapshot().attachmentIds, []);
+assert.deepEqual(attachmentTarget.state.getSnapshot().attachmentIds, ['attachment-1']);
+assert.deepEqual(attachmentRebinds, [['target', ['attachment-1']]]);
+
+const reentrantAttachmentSource = draftInput('attachment draft', false, ['attachment-a', 'attachment-b']);
+const reentrantAttachmentTarget = draftInput('');
+const originalRemoveAttachment = reentrantAttachmentSource.removeAttachment.bind(reentrantAttachmentSource);
+let attachmentRemovals = 0;
+reentrantAttachmentSource.removeAttachment = (id) => {
+  attachmentRemovals += 1;
+  if (attachmentRemovals === 1) {
+    const removed = originalRemoveAttachment(id);
+    reentrantAttachmentSource.setDraft('newer during attachment removal');
+    return removed;
+  }
+  return false;
+};
+const reentrantAttachmentSessions = draftSessions(reentrantAttachmentSource, reentrantAttachmentTarget, () => {});
+assert.equal(T.transferSessionDraft(
+  reentrantAttachmentSessions,
+  'source',
+  'target',
+  T.readSessionDraft(reentrantAttachmentSessions, 'source'),
+  { rebindDraftFiles() {} },
+), false);
+assert.equal(reentrantAttachmentSource.state.getSnapshot().draft, 'newer during attachment removal');
+assert.deepEqual([...reentrantAttachmentSource.state.getSnapshot().attachmentIds].sort(), ['attachment-a', 'attachment-b']);
+assert.deepEqual(reentrantAttachmentTarget.state.getSnapshot().attachmentIds, [],
+  'rollback restores transaction-owned attachments without overwriting newer source text');
+
+const referenceSource = draftInput('@issue', false, [], [{ source: 'forge', ref: 'issue:1' }]);
+const referenceTarget = draftInput('');
+const referenceSessions = draftSessions(referenceSource, referenceTarget, () => { throw new Error('must not open'); });
+assert.equal(T.transferSessionDraft(
+  referenceSessions,
+  'source',
+  'target',
+  T.readSessionDraft(referenceSessions, 'source'),
+  { rebindDraftFiles() {} },
+), false, 'structured references fail closed because setDraft cannot preserve chips');
+assert.equal(referenceSource.state.getSnapshot().draft, '@issue');
+
+const persistedA = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main' }, () => ({ slug: 'stable' }));
+const persistedB = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'main' }, () => ({ slug: 'wrong' }));
+assert.equal(persistedB.txId, persistedA.txId);
+assert.equal(persistedB.targetSessionId, `session-${persistedA.txId}`,
+  'target Session identity is deterministic across lost create responses');
+assert.deepEqual(persistedB.body, { slug: 'stable' }, 'retry keeps the exact request body and slug');
+const persistedConflict = T.heroCreationRequest('source-tx', { cwd: '/a', base: 'other' }, () => ({ slug: 'duplicate' }));
+assert.equal(persistedConflict.txId, persistedA.txId, 'unresolved receipt converges before a changed selection can mint another tx');
+assert.deepEqual(persistedConflict.body, { slug: 'stable' });
+T.clearHeroCreationTx('source-tx', persistedA.txId);
 
 // staging dictionary keys present in both locales
 assert.equal(dictionaries.dicts.zh['hero.stageHint'], '选定基分支即创建并跳转，草稿随迁');

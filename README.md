@@ -73,8 +73,11 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    HEAD) vs HEAD) — all with commit list, per-file hunks, whitespace/wrap
    toggles, plus the paseo action ladder:
    Commit / Pull / Push / Create PR / Merge PR (squash|merge|rebase, auto) /
-   Merge-to-base / Update-from-base / Discard / Archive — every disabled
-   action carries a precise localized reason. PR + checks come from one
+   Merge-to-base / Update-from-base / Discard. Manual physical Archive is
+   intentionally withheld until DSH exposes a cross-page draft + Agent-admission
+   retiring lease; production Host archive endpoints and destructive cleanup
+   also fail closed rather than risking ungrouped sessions. Every disabled action carries a precise
+   localized reason. PR + checks come from one
    batched `gh` GraphQL call (30 s TTL, last-good fallback); PRs poll
    adaptively (20 s pending / 120 s idle). Each editable file head carries
    an `编辑` button opening the shared **file editor**: monospace textarea,

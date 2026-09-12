@@ -22,7 +22,7 @@ const { commitAction, pullAction, pushAction, discardAction, updateFromBaseActio
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
 const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable } = await import('../lib/forge.js');
-const { createCleanupScheduler } = await import('../lib/index.js');
+const { createCleanupScheduler, createCreationSourceGuard, createExactWorkspaceDelete, createWorkspaceArchiveGuard } = await import('../lib/index.js');
 const { hostMutationCoordinator } = await import('../lib/mutation.js');
 
 function git(cwd, ...args) {
@@ -1541,6 +1541,214 @@ await test('api: POST /worktrees with pull → pr-checkout', async () => {
   } finally {
     api.dispose();
     server.close();
+    await hub.dispose();
+  }
+});
+
+await test('creation source guard binds the Host Session identity to cwd', async () => {
+  const sessions = {
+    list: async () => [{ id: 'session-source-guard', header: { cwd: '/repo/source' } }],
+  };
+  const guard = createCreationSourceGuard({ get: (name) => name === 'sessions' ? sessions : undefined });
+  await guard('session-source-guard', '/repo/source');
+  await assert.rejects(guard('session-source-guard', '/repo/rebound'), /no longer owns cwd/);
+  await assert.rejects(guard('session-other', '/repo/source'), /no longer owns cwd/);
+  const unavailable = createCreationSourceGuard({ get: () => undefined });
+  await assert.rejects(unavailable('session-source-guard', '/repo/source'), /unavailable/);
+});
+
+await test('production archive guard disables physical deletion without a retiring lease', async () => {
+  const guard = createWorkspaceArchiveGuard();
+  await assert.rejects(guard('workspace-visible', '/repo/worktree'), /physical archive is disabled/);
+  await assert.rejects(guard(null, '/repo/unregistered-worktree'), /physical archive is disabled/,
+    'unregistered managed worktrees cannot bypass the Session/Agent admission fence');
+});
+
+await test('exact Workspace deletion is session-safe, target-only, and retry-idempotent', async () => {
+  const target = { id: 'delete-target', path: '/managed/target', sessionIds: ['session-target'] };
+  const unrelated = { id: 'delete-unrelated', path: '/managed/unrelated', sessionIds: ['session-unrelated'] };
+  const rows = [target, unrelated];
+  const registry = {
+    archivedSessionIds: [],
+    list: () => rows,
+    async delete(id) {
+      const at = rows.findIndex((row) => row.id === id);
+      if (at < 0) return false;
+      rows.splice(at, 1);
+      return true;
+    },
+  };
+  const removeExact = createExactWorkspaceDelete(registry);
+  await assert.rejects(removeExact(target.id, target.path, ['session-target']), /unarchived session/);
+  assert.deepEqual(rows, [target, unrelated]);
+  registry.archivedSessionIds = ['session-target'];
+  await assert.rejects(removeExact(target.id, '/replacement', ['session-target']), /no longer matches/);
+  await assert.rejects(removeExact(target.id, target.path, ['session-target']), /raw durable membership/,
+    'an existing historical row is retained because captured membership may be incomplete');
+  assert.deepEqual(rows, [target, unrelated], 'unrelated Workspace identity and grouping are untouched');
+  rows.splice(rows.indexOf(target), 1);
+  assert.equal(await removeExact(target.id, target.path, ['session-target']), false,
+    'replay after an already-committed registry deletion is a no-op');
+});
+
+await test('api creation tx replays one durable Workspace and defers destructive registry deletion', async () => {
+  const txRepo = join(scratch, 'creation-tx-repo');
+  mkdirSync(txRepo);
+  git(txRepo, 'init', '-b', 'main');
+  git(txRepo, 'config', 'user.email', 'test@dsh.local');
+  git(txRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(txRepo, 'base.txt'), 'base\n');
+  git(txRepo, 'add', '-A');
+  git(txRepo, 'commit', '-m', 'base');
+  const unrelatedPath = join(scratch, 'creation-tx-unrelated');
+  mkdirSync(unrelatedPath);
+  const unrelated = { workspaceId: 'ws-unrelated', path: unrelatedPath, title: 'Unrelated', sessionIds: ['session-unrelated'] };
+  const rows = [{ workspaceId: 'ws-tx-main', path: txRepo, title: 'tx main', sessionIds: [] }, unrelated];
+  let nextWorkspace = 1;
+  const deleted = [];
+  const hub = createGitStateHub({ onChange: () => {} });
+  const api = createApi(hub, {
+    workspaceRoots: () => rows.map((row) => row.path),
+    workspaceRows: () => rows,
+    worktreeWorkspaces: async () => rows.filter((row) => row.path !== txRepo),
+    createWorkspace: async (path, title) => {
+      const existing = rows.find((row) => row.path === path);
+      if (existing) return existing;
+      const row = { workspaceId: `ws-tx-${nextWorkspace++}`, path, title, sessionIds: [] };
+      rows.push(row);
+      return row;
+    },
+    deleteWorkspace: async (workspaceId, expectedPath) => {
+      const at = rows.findIndex((row) => row.workspaceId === workspaceId && row.path === expectedPath);
+      if (at < 0) return false;
+      rows.splice(at, 1);
+      deleted.push(workspaceId);
+      return true;
+    },
+  });
+  const server = http.createServer((req, res) => api.route.handler(req, res));
+  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+  const endpoint = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
+  const post = (path, body) => fetch(endpoint + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: new URL(endpoint).origin },
+    body: JSON.stringify(body),
+  });
+  const request = {
+    cwd: txRepo,
+    intent: 'branch-off',
+    branchName: 'tx-replay',
+    slug: 'tx-replay',
+    sourceTitle: 'Tx source',
+    sourceSessionId: 'session-create-tx-source',
+    txId: 'client-create-tx-0001',
+  };
+  try {
+    const firstResponse = await post('/worktrees', request);
+    const first = await firstResponse.json();
+    assert.equal(firstResponse.status, 201, JSON.stringify(first));
+    assert.equal(first.ok, true);
+    assert.equal(first.workspaceId, 'ws-tx-1');
+    const secondResponse = await post('/worktrees', request);
+    const second = await secondResponse.json();
+    assert.equal(secondResponse.status, 200, JSON.stringify(second));
+    assert.equal(second.replayed, true);
+    assert.equal(second.path, first.path);
+    assert.equal(second.workspaceId, first.workspaceId);
+    assert.equal(rows.filter((row) => row.path === first.path).length, 1);
+
+    const conflictResponse = await post('/worktrees', { ...request, branchName: 'different-request' });
+    const conflict = await conflictResponse.json();
+    assert.equal(conflictResponse.status, 409, JSON.stringify(conflict));
+    assert.equal(conflict.error, 'transaction_conflict');
+    const duplicateTabResponse = await post('/worktrees', { ...request, txId: 'client-create-tx-0002' });
+    const duplicateTab = await duplicateTabResponse.json();
+    assert.equal(duplicateTabResponse.status, 409, JSON.stringify(duplicateTab));
+    assert.match(duplicateTab.message, /source session already owns another creation transaction/,
+      'two browser realms cannot mint two worktrees for one launcher');
+
+    const archiveResponse = await post('/action', {
+      cwd: first.path,
+      name: 'archive',
+      params: { force: true, deferWorkspaceDelete: true },
+    });
+    const archived = await archiveResponse.json();
+    assert.equal(archiveResponse.status, 200, JSON.stringify(archived));
+    assert.equal(archived.workspaceDeletionDeferred, true);
+    assert.equal(deleted.length, 0, 'registry row remains until client has moved/archived sessions');
+    assert.ok(rows.some((row) => row.workspaceId === first.workspaceId));
+    const pendingResponse = await fetch(`${endpoint}/worktrees/deferred?cwd=${encodeURIComponent(txRepo)}`);
+    const pending = await pendingResponse.json();
+    assert.equal(pendingResponse.status, 200, JSON.stringify(pending));
+    assert.deepEqual(pending.items.map((item) => item.token), [archived.workspaceDeletionToken],
+      'a lost response token remains discoverable from the authorized main checkout');
+
+    rows.splice(rows.findIndex((row) => row.workspaceId === first.workspaceId), 1);
+    const finalizedResponse = await post('/worktrees/finalize-delete', {
+      cwd: txRepo,
+      token: archived.workspaceDeletionToken,
+    });
+    const finalized = await finalizedResponse.json();
+    assert.equal(finalizedResponse.status, 200, JSON.stringify(finalized));
+    assert.equal(finalized.workspaceAlreadyAbsent, first.workspaceId,
+      'retry after registry commit is idempotent and only completes the tombstone');
+    assert.deepEqual(deleted, []);
+    assert.equal(rows.some((row) => row.workspaceId === first.workspaceId), false);
+    assert.equal(rows.find((row) => row.workspaceId === unrelated.workspaceId), unrelated,
+      'deleting one managed worktree preserves every unrelated Workspace row and grouping');
+
+    const archivedReplayResponse = await post('/worktrees', request);
+    const archivedReplay = await archivedReplayResponse.json();
+    assert.equal(archivedReplayResponse.status, 410, JSON.stringify(archivedReplay));
+    assert.equal(archivedReplay.error, 'transaction_retired');
+    assert.equal(archivedReplay.path, first.path);
+    assert.equal(archivedReplay.workspaceId, first.workspaceId);
+    assert.equal(existsSync(first.path), false, 'a committed tx never recreates after explicit archive');
+    const afterRetiredResponse = await post('/worktrees', {
+      ...request,
+      txId: 'client-create-tx-0003',
+      branchName: 'tx-after-retired',
+      slug: 'tx-after-retired',
+    });
+    const afterRetired = await afterRetiredResponse.json();
+    assert.equal(afterRetiredResponse.status, 201, JSON.stringify(afterRetired));
+    const afterRetiredArchive = await post('/worktrees/archive', {
+      path: afterRetired.path,
+      force: true,
+      workspaceId: afterRetired.workspaceId,
+    });
+    assert.equal(afterRetiredArchive.status, 200, JSON.stringify(await afterRetiredArchive.json()));
+
+    const staleSelection = {
+      cwd: txRepo,
+      sourceTitle: 'Stale selector',
+      sourceSessionId: 'session-stale-selector',
+      txId: 'client-stale-tx-0001',
+      base: 'refs/heads/does-not-exist',
+      intent: 'branch-off',
+      slug: 'stale-base',
+    };
+    const staleResponse = await post('/worktrees', staleSelection);
+    const stale = await staleResponse.json();
+    assert.equal(staleResponse.status, 422, JSON.stringify(stale));
+    assert.equal(stale.txState, 'absent', 'post-claim failures prove absence and release source admission');
+    const rotatedResponse = await post('/worktrees', {
+      ...staleSelection,
+      txId: 'client-stale-tx-0002',
+      base: 'main',
+      slug: 'valid-base',
+    });
+    const rotated = await rotatedResponse.json();
+    assert.equal(rotatedResponse.status, 201, JSON.stringify(rotated));
+    const rotatedArchive = await post('/worktrees/archive', {
+      path: rotated.path,
+      force: true,
+      workspaceId: rotated.workspaceId,
+    });
+    assert.equal(rotatedArchive.status, 200, JSON.stringify(await rotatedArchive.json()));
+  } finally {
+    await api.dispose();
+    await new Promise((resolveClose) => server.close(resolveClose));
     await hub.dispose();
   }
 });

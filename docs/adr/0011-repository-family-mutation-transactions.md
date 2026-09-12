@@ -23,4 +23,25 @@
 - 同一仓库中的 Host 变更吞吐量降低，但行为变成确定的 FIFO；不同仓库不受影响。
 - 粗粒度单 gate 避免 merge-to-base 跨两个 worktree 时的多锁死锁，也覆盖共享 refs/config。
 - 该边界只约束插件自己的 Host mutator。用户、Agent 或其他进程直接执行 Git 仍是外部并发，因此破坏性操作保留最终 Git 守卫与所有权 postcondition。
-- create journal 解决 Host 在 add→metadata 窗口崩溃后的收敛；浏览器在 HTTP 成功响应丢失后的 txId 幂等回滚属于客户端 handoff 事务，另行实现。
+- create journal 解决 Host 在 add→metadata 窗口崩溃后的收敛；HTTP 响应丢失与当前工作区归档的跨服务交接由下述 Amendment 1 补齐。
+
+## Amendment 1（2026-09-12）：创建收据与工作区删除交接
+
+### 新背景
+
+浏览器不能根据一次断开的 POST 判断 `worktree add` 是否已经提交；把「未知」当失败并强制删除会误删已经被 Agent 或外部进程继续使用的 worktree。另一个真实故障窗口是：Host 在 archive 响应前先删当前 Workspace 行，Workspace 投影随即卸载发起操作的界面；刷新后该 Workspace 的会话可能显示为「未分组」，客户端也失去先跳转到主仓库的机会。持久 registry 在事后检查中仍保有全部无关 Workspace，说明安全边界应同时覆盖「精确删除哪一行」与「何时删除当前行」，不能用恢复全表来掩盖。
+
+### 补充决策
+
+1. hero 为每个规范化创建意图保留稳定 `txId` 与完整请求体；未决收据必须先收敛，换分支或 PR 也不能直接覆盖它。Host 对规范请求计算指纹，把 `txId + fingerprint` 写入 create journal 与最终受管元数据；同 tx、同指纹重放既有结果，同 tx、不同指纹或不明确 pending 一律 409。journal 用随机临时文件加原子 no-replace 发布，并标记活跃 Host PID；恢复不接管仍存活 owner 的事务。
+2. worktree 元数据提交后，Host 仍在同一 repo-family gate 内 `create(path, title)` 或复用精确路径的 Workspace，并把 `workspaceId` 纳入响应，随后写入独立于目标 worktree 的持久创建收据。该收据在 worktree 被显式归档后仍保留并返回 terminal retired，因此旧 tx 永远不会重新创建；若活 worktree 的 Workspace 行确实缺失，则只采用唯一精确路径行或创建新行，并以原子 receipt generation 记录新 ID。只有 worktree 与 Workspace 两者都可重放时才返回成功。
+3. 创建响应未知时客户端只以同 tx 重试/调和，绝不 force-archive 猜测结果。Host 另以源 Session 身份做原子跨页面 admission；只有证明 tx 没有 journal、receipt 或 worktree 时才释放失败 claim。目标 Session ID 由 tx 确定，响应丢失或多页面重放都收敛到同一个 Session；未完成交接时保留该精确目标供重试，而不是猜测归档。
+4. 当前 Workspace 与 Agent 服务没有共享的“停止接纳新 Session/Agent”租约，浏览器页面之间也没有权威的草稿所有权租约；因此仅靠空草稿快照、composer block 与两次 running 检查不能证明全局安全。此版本从 GUI 动作阶梯移除手工物理归档，并让生产 Host 对所有物理归档路由失败关闭。后台清理也只做非破坏的崩溃事务恢复；在平台提供跨服务 retiring lease 前，不以便利性换取会话失组或另一页面草稿丢失风险。
+5. 对升级前或已进入物理阶段的事务，deferred 墓碑仍持久保存 Session ID 且可由已授权的主 checkout 枚举；响应、页面或 Host 在交接窗口丢失后，新客户端只在可证明安全的精确当前 Session 上续跑，其他情况保留墓碑等待人工/后续租约能力。partial teardown 不清墓碑，直到路径与 Git row 都确实消失。兑现时重新验证 repo owner、墓碑 main root 与随机 token；目标 Workspace 行已不存在时只幂等完成墓碑，仍存在时一律保留，因为旧墓碑的 Session 快照可能漏掉稍后接入的成员，而路径消失后公开投影无法证明原始成员全集。崩溃或失联宁可留下一个指向已归档路径的 Workspace 行，也不把会话变成「未分组」或按路径误删替代行。
+6. 非 GUI/旧客户端未请求 deferred 时继续沿用原有 tombstone 自动收敛，以保持协议兼容；新 GUI 的 deferred token 必须由客户端交接显式完成。
+
+### 补充后果
+
+- 创建可能在调用方看到网络错误后已经成功，但结果保持可见且可用同一收据找回，不再依赖破坏性补偿。
+- GUI 归档多一个跨服务阶段，且客户端崩溃可能暂留不可打开的 Workspace 行；这是为了优先保持会话归组与无关 Workspace 不变量。
+- public Conversation API 可条件转移文本与运行时附件 ID，并由 Conversation 服务重绑文件上传；它不能重建结构化引用 chip，因此存在 chip 时交接失败关闭而不是降级为文本。
