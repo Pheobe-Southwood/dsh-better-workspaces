@@ -9,6 +9,24 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Pheobe-Southwood/dsh-better-workspaces.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Pheobe-Southwood/dsh-better-workspaces/issues"
+  },
+  "homepage": "https://github.com/Pheobe-Southwood/dsh-better-workspaces#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "git",
+    "worktree",
+    "cordis"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -38,9 +56,29 @@
     "lib",
     "README.md",
     "CONTEXT.md",
-    "docs"
+    "docs",
+    "LICENSE",
+    "NOTICE",
+    "LICENSES"
   ],
   "scripts": {
-    "test": "node test/run.js && node test/security.mjs && node test/mutation.mjs && node test/client-smoke.mjs && node test/mount-check.mjs"
+    "lint": "eslint .",
+    "test:host": "node test/run.js",
+    "test:security": "node test/security.mjs",
+    "test:mutation": "node test/mutation.mjs",
+    "test:client": "node test/client-smoke.mjs && node test/client-react.mjs",
+    "test:mount": "node test/mount-check.mjs",
+    "test": "npm run test:host && npm run test:security && npm run test:mutation && npm run test:client && npm run test:mount",
+    "test:pack": "node test/package.mjs",
+    "check": "npm run lint && npm test && npm run test:pack",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.10.0",
+    "globals": "17.12.0",
+    "jsdom": "24.1.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   }
 }

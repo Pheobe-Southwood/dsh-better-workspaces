@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, statSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, statSync, renameSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,7 +18,7 @@ const { detectRepo, resolveDefaultBranch, listBranches, currentBranchInfo, diffS
 const { createWorktree, listManagedWorktrees, readMetadata, patchMetadata, archiveWorktree, prepareWorkspaceDeletion, pendingWorkspaceDeletions, completeWorkspaceDeletion, recoverPendingTransactions, repoWorktreesRoot, worktreesRoot, validateManagedWorktree } = await import('../lib/worktree.js');
 const { createAutoNamer, validateBranchSlug, cleanBranchName, parseNamePayload } = await import('../lib/autoname.js');
 const { computeDiff, commitDiff, resolveDiffRefs } = await import('../lib/diff.js');
-const { commitAction, pullAction, pushAction, discardAction, updateFromBaseAction, buildActionLadder, executeAction } = await import('../lib/actions.js');
+const { commitAction, pullAction, pushAction, discardAction, updateFromBaseAction, createPrAction, buildActionLadder } = await import('../lib/actions.js');
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
 const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable, parseGithubRemote, prStatus, prStatusBatch, invalidatePr, createPullRequest, mergePullRequest, disableAutoMerge } = await import('../lib/forge.js');
@@ -46,7 +46,8 @@ async function test(label, fn) {
     await fn();
     results.push(`PASS ${label}`);
   } catch (error) {
-    results.push(`FAIL ${label}: ${error.message}`);
+    const detail = typeof error?.stack === 'string' ? error.stack : String(error?.message ?? error);
+    results.push(`FAIL ${label}: ${detail}`);
     process.exitCode = 1;
   }
 }
@@ -1203,6 +1204,26 @@ await test('action ladder (synthetic snapshots)', async () => {
   assert.ok(ids.includes('push'));
   assert.ok(ids.includes('createPr'));
   assert.equal(ladder.find((e) => e.id === 'commit').reasonKey, 'actions.commit.clean');
+  const unpublished = { ...clean, upstream: null, originDelta: null, aheadBehind: { ahead: 1, behind: 0 } };
+  assert.equal(buildActionLadder(unpublished).find((entry) => entry.id === 'push').disabled, false,
+    'an ordinary branch with commits ahead of its base can publish to origin');
+  const untrackedPrPush = buildActionLadder({ ...unpublished, prHeadRef: 'contributor-change', originDelta: { ahead: 2, behind: 0 } })
+    .find((entry) => entry.id === 'push');
+  assert.equal(untrackedPrPush.disabled, true,
+    'a PR checkout without a verified upstream never infers a push target from base or a coincidental origin ref');
+  assert.equal(untrackedPrPush.reasonKey, 'actions.push.prCheckout');
+  assert.equal(buildActionLadder({
+    ...unpublished,
+    prHeadRef: 'contributor-change',
+    upstream: { ref: 'refs/remotes/origin/contributor-change', ahead: 1, behind: 0 },
+  }).find((entry) => entry.id === 'push').disabled, false,
+  'a same-repo PR checkout with the exact verified origin upstream can push');
+  assert.equal(buildActionLadder({ ...unpublished, prPollingDisabled: true })
+    .find((entry) => entry.id === 'push').disabled, true,
+  'malformed or legacy PR provenance keeps push fail-closed');
+  assert.equal(buildActionLadder({ ...unpublished, prHeadRef: 'contributor-change', pr: { state: 'closed' } })
+    .some((entry) => entry.id === 'createPr'), false,
+  'a closed PR checkout is not offered a second Create PR path');
   // agentRunning disables mutations but not readOnly
   ladder = buildActionLadder(clean, { agentRunning: true });
   assert.equal(ladder.find((e) => e.id === 'push').disabled, true);
@@ -1457,6 +1478,31 @@ await test('pr-checkout: a taken local branch name uniquifies (-1, -2)', async (
       assert.equal(git(created.path, 'rev-parse', 'HEAD').trim(), prSameRepoHead);
       assert.equal((await readMetadata(created.path)).pullHeadRef, 'pr-same-repo');
     }
+
+    // A trusted same-repo checkout may have a uniquified local branch while
+    // tracking the verified, non-uniquified origin head. Push must use an
+    // explicit origin refspec rather than push.default=simple.
+    const originBefore = git(prRepo, 'remote', 'get-url', 'origin').trim();
+    try {
+      git(prRepo, 'update-ref', 'refs/remotes/origin/pr-same-repo', prSameRepoHead);
+      git(wt.path, 'branch', '--set-upstream-to=origin/pr-same-repo', wt.branch);
+      git(prRepo, 'remote', 'set-url', 'origin', 'https://github.com/test-owner/test-repo.git');
+      git(prRepo, 'config', 'remote.origin.pushurl', prRemote);
+      writeFileSync(join(wt.path, 'same-repo-push.txt'), 'next\n');
+      git(wt.path, 'add', '-A');
+      git(wt.path, 'commit', '-m', 'same-repo follow-up');
+      const pushedSha = git(wt.path, 'rev-parse', 'HEAD').trim();
+      const pushed = await pushAction(wt.path);
+      assert.equal(pushed.ok, true, JSON.stringify(pushed));
+      assert.equal(git(prRemote, 'rev-parse', 'refs/heads/pr-same-repo').trim(), pushedSha);
+      assert.equal(tryGit(prRemote, 'rev-parse', '--verify', '--quiet', `refs/heads/${wt.branch}`), null,
+        'the uniquified local branch name is never published');
+    } finally {
+      git(prRepo, 'remote', 'set-url', 'origin', originBefore);
+      tryGit(prRepo, 'config', '--unset-all', 'remote.origin.pushurl');
+      tryGit(prRemote, 'update-ref', '-d', 'refs/heads/pr-same-repo');
+      tryGit(prRepo, 'update-ref', '-d', 'refs/remotes/origin/pr-same-repo');
+    }
   } finally {
     for (const created of [wt, wt2]) await archiveWorktree(created.path, { force: true });
   }
@@ -1485,6 +1531,16 @@ await test('pr-checkout: fork PR → owner-prefixed branch, no upstream', async 
     assert.equal(git(prRepo, 'for-each-ref', '--format=%(refname)', 'refs/dsh-better-workspaces/pr/').trim(), '');
     // and nothing was synthesized as the BASE repo's origin/dark-mode
     assert.equal(tryGit(prRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/dark-mode'), null);
+    const pushed = await pushAction(wt.path);
+    assert.equal(pushed.ok, false);
+    assert.equal(pushed.reasonKey, 'actions.push.prCheckout');
+    assert.equal(tryGit(prRemote, 'rev-parse', '--verify', '--quiet', 'refs/heads/alice/dark-mode'), null,
+      'direct Push must not publish a fork PR branch into the base origin');
+    const secondPr = await createPrAction(wt.path, { title: 'must not publish' });
+    assert.equal(secondPr.ok, false);
+    assert.equal(secondPr.reasonKey, 'actions.pr.checkout');
+    assert.equal(tryGit(prRemote, 'rev-parse', '--verify', '--quiet', 'refs/heads/alice/dark-mode'), null,
+      'direct Create PR must not preliminarily publish a fork PR branch into the base origin');
   } finally {
     await archiveWorktree(wt.path, { force: true });
   }
@@ -2039,9 +2095,11 @@ await test('api serializes same-repo worktree creation and actions', async () =>
 /* ---------------- HTTP layer ---------------- */
 await test('api routes over real HTTP', async () => {
   const hub = createGitStateHub({ onChange: () => {} });
+  let exchangeRace = null;
   const api = createApi(hub, {
     workspaceRoots: () => [repo, scratch],
     worktreeWorkspaces: async () => [{ workspaceId: 'ws-provider-x', path: '/tmp/provider-x' }],
+    beforeFileExchange: async (target) => exchangeRace?.(target),
   });
   const server = http.createServer((req, res) => api.route.handler(req, res));
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -2091,8 +2149,32 @@ await test('api routes over real HTTP', async () => {
     assert.equal(casConflict.error, 'conflict');
     assert.equal(readFileSync(editable, 'utf8'), 'one\n', 'conflict must not write');
     const writeOk = await post('/file', { cwd: repo, path: 'editable.txt', content: 'two\n', baseSha1: baseSha });
-    assert.equal(writeOk.ok, true);
-    assert.equal(readFileSync(editable, 'utf8'), 'two\n');
+    if (writeOk.ok) {
+      assert.equal(readFileSync(editable, 'utf8'), 'two\n');
+      exchangeRace = () => writeFileSync(editable, 'external-race\n');
+      let racedSave;
+      try {
+        racedSave = await post('/file', {
+          cwd: repo,
+          path: 'editable.txt',
+          content: 'must-not-win\n',
+          baseSha1: createHash('sha1').update(Buffer.from('two\n')).digest('hex'),
+        });
+      } finally {
+        exchangeRace = null;
+      }
+      assert.equal(racedSave.ok, false);
+      assert.equal(racedSave.error, 'conflict');
+      assert.equal(racedSave.message, 'file changed on disk during save');
+      assert.equal('recovery' in racedSave, false, 'owned temporary file was removed before the conflict response');
+      assert.equal(readFileSync(editable, 'utf8'), 'external-race\n', 'the concurrent writer remains authoritative');
+      assert.equal(readdirSync(repo).some((name) => name.startsWith('.bw-') && name.endsWith('.tmp')), false);
+    } else {
+      assert.match(String(writeOk.error || writeOk.message || JSON.stringify(writeOk)), /atomic file exchange unavailable/);
+      assert.equal(readFileSync(editable, 'utf8'), 'one\n', 'an unavailable exchange primitive fails closed');
+      assert.equal(readdirSync(repo).some((name) => name.startsWith('.bw-') && name.endsWith('.tmp')), false,
+        'a failed exchange removes its owned temporary file');
+    }
     const writeEscape = await post('/file', { cwd: repo, path: '../escape.txt', content: 'x' });
     assert.equal(writeEscape.ok, false);
     assert.equal(writeEscape.error, 'path escapes workspace');
