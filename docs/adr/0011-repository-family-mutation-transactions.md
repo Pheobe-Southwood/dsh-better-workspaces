@@ -45,3 +45,22 @@
 - 创建可能在调用方看到网络错误后已经成功，但结果保持可见且可用同一收据找回，不再依赖破坏性补偿。
 - GUI 归档多一个跨服务阶段，且客户端崩溃可能暂留不可打开的 Workspace 行；这是为了优先保持会话归组与无关 Workspace 不变量。
 - public Conversation API 可条件转移文本与运行时附件 ID，并由 Conversation 服务重绑文件上传；它不能重建结构化引用 chip，因此存在 chip 时交接失败关闭而不是降级为文本。
+
+## Amendment 2（2026-09-12）：Git 元数据能力与 Hub 生命周期
+
+### 新背景
+
+仅固定工作树目录并不足以阻止路径替换：普通仓库可用 `.git` 文件指向外置 Git dir，linked worktree 还会共享 common dir；如果命令在授权后重新按路径发现这些目录，攻击者可在检查与执行之间替换再恢复（ABA）。另一方面，Hub 的异步授权、watcher、fetch 与 PR poll 会跨 Cordis 更新排空，旧 generation 的完成值不能写回新实例。
+
+### 补充决策
+
+1. Workspace 能力同时携带 worktree Git dir、common dir 及二者 dev/inode。Linux 读取和主要写事务分别打开、复验并持有工作树、主仓库、Git dir 与 common dir，把 `GIT_DIR`、`GIT_COMMON_DIR`、`GIT_WORK_TREE` 指向宿主进程的 `/proc/<pid>/fd/<n>`；这也支持 `.git` 文件与 separate-git-dir。非 Linux 没有等价锚点时失败关闭，而不以“事后再验”冒充稳定读取。
+2. Git 环境与生命周期 AbortSignal 通过 AsyncLocalStorage 传播；全局并发队列在入队前捕获调用者作用域、出队后重新进入，避免并发请求互相泄漏 Git 身份。新 worktree 建成后的自身验证会显式退出来源仓库作用域，防止把来源的 Git dir 误当成新目标。
+3. Hub 的 target 由 `session/cwd` generation、精确 map 身份和 lifecycle signal 共同围栏。授权逆序返回、切换后旧请求、dispose 后 watcher/fetch/Forge 完成都不能发布；强制刷新在已有计算期间只排队一个后继 generation，部分 watcher 覆盖降级为轮询。
+4. SSE、target/negative/client caches 与 mutation lease 均设上限或精确 owner token；停止时中止可取消的 Git/gh 请求并销毁慢 SSE 客户端。已经越过破坏性 commit point 的事务仍按本 ADR 的原规则排空到一致终态。
+
+### 补充后果
+
+- Linux `/proc` 成为稳定 Git API 的明确平台前提；换取的是读取和写入都不再依赖可被路径 ABA 替换的元数据发现。
+- Git helper 的调用上下文成为能力的一部分，测试必须覆盖并发队列饱和、外置 Git dir 和环境变量清洗。
+- Hub 更新/停止更快且不会把旧会话结果投射到新 cwd，但缓存和 SSE 超限时会主动淘汰或断开而不是无限保留。

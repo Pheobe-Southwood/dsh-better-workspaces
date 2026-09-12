@@ -94,7 +94,7 @@ const base = `${origin}${API_PREFIX}`;
 async function request(path, init) {
   const response = await fetch(base + path, init);
   const text = await response.text();
-  let body = null;
+  let body;
   try {
     body = text === '' ? null : JSON.parse(text);
   } catch {
@@ -204,21 +204,29 @@ try {
   linkSync(outsideHard, insideHard);
   const hardSha = createHash('sha1').update('shared-before\n').digest('hex');
   const savedHard = await request('/file', jsonInit({ cwd: repo, path: 'inside-hard.txt', content: 'inside-after\n', baseSha1: hardSha }));
-  assert.equal(savedHard.status, 200, JSON.stringify(savedHard.body));
-  assert.equal(readFileSync(insideHard, 'utf8'), 'inside-after\n');
-  assert.equal(readFileSync(outsideHard, 'utf8'), 'shared-before\n');
-  assert.equal(statSync(insideHard).mode & 0o777, 0o664);
+  if (savedHard.status === 200) {
+    assert.equal(readFileSync(insideHard, 'utf8'), 'inside-after\n');
+    assert.equal(readFileSync(outsideHard, 'utf8'), 'shared-before\n');
+    assert.equal(statSync(insideHard).mode & 0o777, 0o664);
 
-  // Same-base saves are serialized at the commit boundary: exactly one wins,
-  // and the winner's bytes must be the bytes left on disk.
-  const concurrentBase = createHash('sha1').update('inside-after\n').digest('hex');
-  const concurrentContents = ['writer-a\n', 'writer-b\n', 'writer-c\n'];
-  const concurrentSaves = await Promise.all(concurrentContents.map((content) =>
-    request('/file', jsonInit({ cwd: repo, path: 'inside-hard.txt', content, baseSha1: concurrentBase }))));
-  const winners = concurrentSaves.map((response, index) => ({ response, index })).filter(({ response }) => response.status === 200);
-  assert.equal(winners.length, 1, JSON.stringify(concurrentSaves.map((response) => response.body)));
-  assert.equal(concurrentSaves.filter((response) => response.status === 409).length, 2);
-  assert.equal(readFileSync(insideHard, 'utf8'), concurrentContents[winners[0].index]);
+    // Same-base saves are serialized at the commit boundary: exactly one wins,
+    // and the winner's bytes must be the bytes left on disk.
+    const concurrentBase = createHash('sha1').update('inside-after\n').digest('hex');
+    const concurrentContents = ['writer-a\n', 'writer-b\n', 'writer-c\n'];
+    const concurrentSaves = await Promise.all(concurrentContents.map((content) =>
+      request('/file', jsonInit({ cwd: repo, path: 'inside-hard.txt', content, baseSha1: concurrentBase }))));
+    const winners = concurrentSaves.map((response, index) => ({ response, index })).filter(({ response }) => response.status === 200);
+    assert.equal(winners.length, 1, JSON.stringify(concurrentSaves.map((response) => response.body)));
+    assert.equal(concurrentSaves.filter((response) => response.status === 409).length, 2);
+    assert.equal(readFileSync(insideHard, 'utf8'), concurrentContents[winners[0].index]);
+  } else {
+    assert.equal(savedHard.status, 503, JSON.stringify(savedHard.body));
+    assert.match(savedHard.body?.message || '', /atomic file exchange unavailable/);
+    assert.equal(readFileSync(insideHard, 'utf8'), 'shared-before\n', 'unsupported exchange fails before modifying either inode');
+    assert.equal(readFileSync(outsideHard, 'utf8'), 'shared-before\n');
+    assert.equal(readdirSync(repo).some((name) => name.startsWith('.bw-') && name.endsWith('.tmp')), false,
+      'fail-closed save removes its owned temporary file before responding');
+  }
 
   writeFileSync(join(repo, 'unsafe.svg'), '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
   const svg = await request(`/raw?cwd=${encodeURIComponent(repo)}&path=unsafe.svg`);
@@ -452,8 +460,15 @@ try {
   observeMutation = null;
   assert.equal(readFileSync(nestedFile, 'utf8'), 'before\n');
   releaseGitFamily();
-  assert.equal((await nestedSave).status, 200);
-  assert.equal(readFileSync(nestedFile, 'utf8'), 'after\n');
+  const nestedResponse = await nestedSave;
+  if (nestedResponse.status === 200) {
+    assert.equal(readFileSync(nestedFile, 'utf8'), 'after\n');
+  } else {
+    assert.equal(nestedResponse.status, 503, JSON.stringify(nestedResponse.body));
+    assert.match(nestedResponse.body?.message || '', /atomic file exchange unavailable/);
+    assert.equal(readFileSync(nestedFile, 'utf8'), 'before\n');
+    assert.equal(readdirSync(nested).some((name) => name.startsWith('.bw-') && name.endsWith('.tmp')), false);
+  }
 
   // Authorization is captured before queueing, then re-proven after the outer
   // workspace gate. Reusing the same lexical root with a new inode must not let

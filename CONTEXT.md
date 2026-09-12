@@ -37,7 +37,7 @@ _Avoid_: 主目录、原目录
 _Avoid_: 临时目录、副本
 
 **仓库族变更门（repo-family mutation gate）**：
-同一主仓库及其全部 linked worktree 共享的宿主 FIFO 变更序列，键为授权阶段固定的规范主仓库根。create、archive、action、后台 fetch、自动改名和 Git 工作区文件保存都经此门；锁内同时复验目标根与主仓库根的设备号/inode，并在 Linux 上以 dirfd 锚定跨多条命令的目标，固定顺序是仓库门→文件 mutex。不同仓库仍可并行，Agent 或用户在插件外直接运行 Git 不受此门约束。
+同一主仓库及其全部 linked worktree 共享的宿主 FIFO 变更序列，键为授权阶段固定的规范主仓库根。create、archive、action、后台 fetch、自动改名和 Git 工作区文件保存都经此门；锁内同时复验目标根、主仓库根、worktree Git dir 与 common dir 的设备号/inode，并在 Linux 上以 dirfd 锚定读取和跨多条命令的目标，固定顺序是仓库门→文件 mutex。不同仓库仍可并行，Agent 或用户在插件外直接运行 Git 不受此门约束。
 _Avoid_: 全局锁、worktree 锁
 
 **创建事务日志（create journal）**：

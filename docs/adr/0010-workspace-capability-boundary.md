@@ -12,4 +12,4 @@ DSH 的外层认证只能说明调用者是谁，不能说明一次请求可操�
 
 ## Consequences
 
-Workspace registry 成为宿主 API 的硬依赖；调用者不能通过传入另一个绝对路径扩大权限。唯一的跨根写入是 Merge-to-base 由已授权 linked worktree 的 Git common-dir 推导出的主 checkout；任意其他 linked worktree 目标仍必须独立授权。托管 worktree 的全局根与仓库 hash 根必须是直接规范目录，创建前、`git worktree add` 前和元数据落盘前都会重验。历史伪造或损坏的 worktree 元数据不会被当作托管资产，清理与归档也不会在所有权未知或会话守卫不可读时删除目录；会话占用包含 worktree 的任意子目录，并在实际归档前刷新。客户端仍可解析原 JSON 结果，但输入、授权、冲突、缺失、过大与依赖故障使用对应的非 2xx HTTP 状态。
+Workspace registry 成为宿主 API 的硬依赖；调用者不能通过传入另一个绝对路径扩大权限。唯一的跨根写入是 Merge-to-base 由已授权 linked worktree 的 Git common-dir 推导出的主 checkout；任意其他 linked worktree 目标仍必须独立授权。托管 worktree 的全局根与仓库 hash 根必须是直接规范目录；授权能力还固定 worktree Git dir 与 common dir 的身份，并在 Linux 上持有目录句柄（含 `.git` 文件和 separate-git-dir），创建前、`git worktree add` 前和元数据落盘前都会重验。历史伪造或损坏的 worktree 元数据不会被当作托管资产，清理与归档也不会在所有权未知或会话守卫不可读时删除目录；会话占用包含 worktree 的任意子目录，并在实际归档前刷新。客户端仍可解析原 JSON 结果，但输入、授权、冲突、缺失、过大与依赖故障使用对应的非 2xx HTTP 状态。

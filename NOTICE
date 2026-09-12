@@ -1,11 +1,31 @@
 dsh-better-workspaces
 Copyright (c) 2026 the dsh-better-workspaces authors
 
-This product includes material ported from other MIT-licensed projects:
+This product contains modified and independently adapted material from:
 
-1. Worktree/branch semantics (base-branch-off-remote, mnemonic placeholder
-   slugs, first-message auto-naming, branch-slug validation) are derived
-   from study of the paseo project (MIT) and the dsh-git-worktree project
-   (https://github.com/wloops/dsh-git-worktree, MIT) — see docs/adr/0004.
+Paseo
+Copyright (c) 2025-present Mohamed Boudra
+https://github.com/getpaseo/paseo
+Source revision reviewed: d1b705a0cd91617a5707fae25d80cb0be3057950
+Licensed under the Apache License, Version 2.0. The complete license text is
+in LICENSES/paseo-Apache-2.0.txt.
 
-No endorsement by the original authors is implied.
+The naming contract and branch-slug routines in lib/autoname.js are modified
+ports of packages/server/src/server/workspace-auto-name.ts and
+packages/protocol/src/branch-slug.ts. Worktree, diff, forge and action behavior
+was independently adapted from the corresponding Paseo domain model and then
+substantially modified for DSH, including capability authorization, durable
+transactions, argv-only Git execution, fail-closed recovery and Cordis
+lifecycle integration. No endorsement by the Paseo authors is implied.
+
+
+dsh-git-worktree
+Copyright (c) 2026 wloops
+https://github.com/wloops/dsh-git-worktree
+Source revision reviewed: d8a0bc00718e393f1e1cffbe1552021058a541ce
+Licensed under the MIT License. The complete copyright and permission notice is
+in LICENSES/dsh-git-worktree-MIT.txt.
+
+Managed-worktree layout and branch lifecycle concepts were studied and adapted,
+then substantially modified for the safety and transaction model described in
+this repository's ADRs. No endorsement by the original author is implied.

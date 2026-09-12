@@ -1,45 +1,34 @@
 /**
  * Client-bundle smoke test (Node): simulates window.__ModuleLoader__,
- * materializes the factory with the real react/react-dom from the dsh
- * install, runs apply() against a mock ctx, and validates the slot
- * registrations + locale dictionary parity. No browser needed.
+ * materializes the factory with transparent structural hook stubs, verifies
+ * the project-owned React runtime resolves, runs apply() against a mock ctx,
+ * and validates slot registrations + locale parity. Real rendering lives in
+ * client-react.mjs; this suite intentionally keeps element trees inspectable.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
-// resolve react from the dsh root and react-dom from a bundle that carries it
-const dshRequire = createRequire(
-  '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-trajectory/seed.js',
-);
-
-// A dsh install whose react/react-dom links are pruned or dangling would make
-// this suite unrunnable even though it never RENDERS a component. Keep the
-// real runtime when it resolves; otherwise fall back to the minimal surface
-// the bundle touches at module scope (createElement + hook names) and say so.
-let runtimeRequire = dshRequire;
-try {
-  dshRequire('react');
-  dshRequire('react-dom/client');
-} catch {
-  console.warn('[client-smoke] real react/react-dom not resolvable from the dsh install — using a stub (no component rendering in this suite)');
-  const stubReact = {
-    createElement: (...args) => ({ type: args[0], props: args[1], children: args.slice(2) }),
-    useState: (value) => [value, () => {}],
-    useEffect: () => {},
-    useLayoutEffect: () => {},
-    useRef: (value) => ({ current: value }),
-    useCallback: (fn) => fn,
-    useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
-    Fragment: Symbol('Fragment'),
-  };
-  const stubReactDomClient = { createRoot: () => ({ render() {}, unmount() {} }) };
-  runtimeRequire = (spec) => {
-    if (spec === 'react') return stubReact;
-    if (spec === 'react-dom/client') return stubReactDomClient;
-    return dshRequire(spec);
-  };
-}
+// Project-owned exact dev dependencies make this smoke deterministic and
+// portable; the separate client-react suite exercises browser effects.
+const runtimeRequire = createRequire(import.meta.url);
+runtimeRequire('react');
+runtimeRequire('react-dom/client');
+const structuralReact = {
+  createElement: (...args) => ({ type: args[0], props: args[1], children: args.slice(2) }),
+  useState: (value) => [value, () => {}],
+  useEffect: () => {},
+  useLayoutEffect: () => {},
+  useRef: (value) => ({ current: value }),
+  useCallback: (fn) => fn,
+  useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+  Fragment: Symbol('Fragment'),
+};
+const factoryRequire = (specifier) => {
+  if (specifier === 'react') return structuralReact;
+  if (specifier === 'react-dom/client') return { createRoot: () => ({ render() {}, unmount() {} }) };
+  return runtimeRequire(specifier);
+};
 
 globalThis.window = globalThis;
 let loadedEntry = null;
@@ -56,7 +45,7 @@ assert.ok(loadedEntry, 'bundle called __ModuleLoader__.load');
 assert.equal(loadedEntry.id, 'dsh-better-workspaces');
 assert.equal(typeof loadedEntry.factory, 'function');
 
-const mod = loadedEntry.factory((spec) => runtimeRequire(spec));
+const mod = loadedEntry.factory(factoryRequire);
 assert.equal(typeof mod.apply, 'function', 'exports.apply');
 assert.deepEqual(mod.inject, ['slots', 'locale', 'sessions', 'workspaces']);
 
@@ -124,7 +113,7 @@ const ctx = {
       dictionaries = { ns, dicts };
       return () => {};
     },
-    bind(ns) {
+    bind(_ns) {
       return (key, params) => {
         let template = dictionaries.dicts.zh[key] ?? key;
         if (params) {
@@ -309,17 +298,9 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
    This mounts it for real and drives every slot hook, so any hook signature
    drift fails here instead of silently in the browser. */
 {
-  let reactDomServer = null;
-  try {
-    reactDomServer = runtimeRequire('react-dom/server');
-  } catch {
-    // react-dom's server entry is not resolvable here: fall back to calling the
-    // component directly with faithful hook stubs. That still runs the whole
-    // body (and therefore every hook call) — it only skips React's own
-    // reconciliation, which is not what this guard is about.
-    reactDomServer = null;
-  }
-  const { ForgeAttachControl, ForgePicker } = mod.__bwTest;
+  // Keep this white-box contract walker independent of React's opaque element
+  // internals. Real reconciliation/effects are mandatory in client-react.mjs.
+  const { ForgeAttachControl } = mod.__bwTest;
   assert.equal(typeof ForgeAttachControl, 'function', 'the control is exported for this suite');
   // the control asks the session list for its cwd and renders nothing without
   // one (that guard is deliberate), so give the mock a session that has one
@@ -336,9 +317,7 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     // the framework hands the session-scope actions alongside the hooks
     inputActions: { setDraft() {} },
   };
-  const tree = reactDomServer === null
-    ? ForgeAttachControl(props)
-    : reactDomServer.renderToStaticMarkup(runtimeRequire('react').createElement(ForgeAttachControl, props));
+  const tree = ForgeAttachControl(props);
   assert.deepEqual(hooks, [['useInput', 'function']], 'the control reads the draft through the slot hook');
   // walk the element tree the control returned, so the assertion holds for both
   // the rendered string and the direct call
@@ -362,14 +341,9 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
   assert.match(flat, /dsh-bw-forge/, 'the control returns its wrapper element');
   assert.match(flat, /dsh-bw-forge-btn/, 'the forge button is in the returned tree');
   assert.match(flat, /添加 issue 或 PR/, 'and carries its localized aria-label');
-  assert.ok(
-    types.filter((type) => typeof type === 'function').length >= 1,
-    'the GitHub mark glyph component is part of the subtree',
-  );
-  assert.ok(
-    types.includes('button'),
-    'the control renders a real button element',
-  );
+  assert.ok(types.filter((type) => typeof type === 'function').length >= 1,
+    'the GitHub mark glyph component is part of the subtree');
+  assert.ok(types.includes('button'), 'the control renders a real button element');
 
   /* ---- the pick path: selecting a row must actually reach the composer ----
      Two live bugs hid behind this, both silent:

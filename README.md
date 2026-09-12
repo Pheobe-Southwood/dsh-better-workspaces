@@ -1,7 +1,7 @@
 # dsh-better-workspaces
 
 Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
-[paseo](https://github.com/paseo-dev/paseo)'s worktree/diff/PR model.
+[Paseo](https://github.com/getpaseo/paseo)'s worktree/diff/PR model.
 
 ## What it adds
 
@@ -36,10 +36,9 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    `refs/pull/<N>/head` — the only ref a fork's contribution has — the local
    branch is `<headRef>`, or `<owner>/<headRef>` for a fork, and the PR's own
    base branch becomes the diff baseline rather than whatever the picker was
-   pointed at. A same-repo PR tracks `origin/<headRef>` (the tracking ref is
-   materialized from the fetched SHA, so `@{upstream}` resolves even when the
-   contributor's branch was never pushed); a fork PR deliberately gets no
-   upstream, so the unpushed count and the pull/push ladder stay explicit
+   pointed at. A same-repo PR tracks `origin/<headRef>` only when that existing
+   remote-tracking ref already resolves to the verified PR head; it never
+   manufactures or overwrites the ref. A fork PR deliberately gets no upstream, so the unpushed count and the pull/push ladder stay explicit
    instead of aiming at the wrong branch. PR worktrees carry no placeholder
    branch and are never renamed by the first message. Inside a worktree
    workspace the hero control hides entirely, and the sidebar row trades its
@@ -84,7 +83,7 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    dirty marker, Ctrl/Cmd+S, saved through `POST /file` with sha1
    compare-and-swap (concurrent on-disk change → 409 conflict + reload,
    never a silent overwrite; containment/size/binary guards, atomic
-   tmp+rename write).
+   exchange with displaced-inode verification).
 5. **Composer GitHub control** — a GitHub-mark button beside the composer's
    native `+` (commands) and paperclip (files). Those two are hardcoded in the
    official InputBar and are left untouched; the plugin only adds a third
@@ -100,9 +99,9 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    its only door) — and the source stays registered for the
    plugin's lifetime, because a chip whose source has no serializer makes the
    send fail loudly instead of silently degrading. If the
-   official `insertReference` revision CAS refuses the write, the plugin
-   appends the plain `@N` token instead, which the decoration scan still
-   renders as a chip. Missing `gh` / not signed in / no usable remote are
+   official `insertReference` revision CAS refuses the write, the plugin leaves
+   the draft unchanged and keeps the picker open so the user can retry or
+   cancel; it never substitutes a lossy plain-text token. Missing `gh` / not signed in / no usable remote are
    surfaced in the picker rather than handled.
 
 ## Architecture
@@ -138,9 +137,13 @@ See `CONTEXT.md` for the glossary and `docs/adr/` for the design records.
 
 ## Install (web profile)
 
-Prerequisites: `dsh` ≥ 0.1.5 with the `web` profile, `pnpm` on `PATH`, and
-`git` ≥ 2.31. `gh` (authenticated) is optional — it enables the PR/checks
-features and the composer's issue/PR picker and PR checkout, and degrades
+Prerequisites: `dsh` ≥ 0.1.5 with the `web` profile, Node.js ≥ 20.19,
+`pnpm` on `PATH`, Linux, `git` ≥ 2.31, and GNU coreutils `mv` with
+`--exchange` for atomic editor saves. Linux is required because stable
+repository mutations and file saves use `/proc` dirfd anchors; unsupported
+platforms—and systems without atomic exchange for saves—fail closed with HTTP
+503 instead of weakening the CAS guarantee. `gh` (authenticated) is optional — it
+enables the PR/checks features and the composer's issue/PR picker and PR checkout, and degrades
 gracefully when absent.
 
 **One command installs and mounts the plugin** (plain JS, no build step):
@@ -211,15 +214,37 @@ dsh plugin --profile web add link:/path/to/dsh-better-workspaces
 Host code edits need a `dsh` restart (Node's ESM cache survives patch reloads —
 ADR 0003); client-bundle edits hot-rebuild in the module graph and only need a
 page refresh. The package's `cordis.patch.yml` is composed at boot, so editing
-*that* file needs a restart too. The row declares `inject: ['webServer']`, so
-cold boot waits for the web server instead of racing it (ADR 0005) — if the UI
+*that* file needs a restart too. The row declares hard injects for `webServer` and `workspaceRegistry`,
+so cold boot waits for both the HTTP surface and the registry-backed authorization
+source instead of racing either one (ADRs 0005 and 0010) — if the UI
 is missing after a restart, run the self-check in the ops section below.
 
-## Test
+## Development and quality gates
+
+Repository development uses npm and the committed lockfile; `pnpm` above is a
+DSH installer/runtime prerequisite, not this repository's package manager.
+React and ReactDOM are supplied to the browser half by the DSH module graph;
+matching React 18 versions are development-only dependencies for deterministic
+real lifecycle tests.
 
 ```bash
-npm test   # standalone host-layer smoke suite (scratch repo + real HTTP)
+npm ci
+npm run check
 ```
+
+`npm run check` runs ESLint, scratch-repository Host tests, security and
+mutation suites, the fast client contract smoke test, a real React + JSDOM
+effect/focus/cleanup suite, mount checks, and an npm-pack allowlist test that
+requires NOTICE plus all third-party licenses. CI repeats the same gate on the
+latest Node 20 and Node 22 releases on Ubuntu.
+
+## Third-party attribution
+
+Original project code is MIT-licensed; modified or independently adapted
+third-party portions retain their notices from Paseo (Apache-2.0) and
+dsh-git-worktree (MIT). Exact audited revisions,
+modification notices and complete license texts ship in `NOTICE` and
+`LICENSES/`.
 
 
 ## 运维：冷启动挂载与重启自检
@@ -248,10 +273,12 @@ include 的 `insert` 是原样追加、不按 id 去重，loader 见到重复 id
    手写行，删掉它）；
 2. `curl -s http://127.0.0.1:3080/better-workspaces/api/worktree-workspaces` ——
    期望 `{"ok":true,...}`（404 = 行未激活：确认 profile `node_modules` 的
-   link 依赖存在，且 `lib/index.js` 的 inject 仍含 `webServer`）；
+   link 依赖存在，且 `lib/index.js` 的 inject 仍同时含 `webServer` 与
+   `workspaceRegistry`）；
 3. 刷新 GUI：非 worktree 工作区出现「本地」hero 控制，worktree 工作区隐藏且行图标为分支。
 
-`npm test` 含 `test/mount-check.mjs`：断言 `inject` 含 `webServer`（防回归）、
+`npm test` 含 `test/mount-check.mjs`：断言 `inject` 同时含 `webServer` 与
+`workspaceRegistry`（防回归，后者提供授权根）、
 断言包声明 `dsh.bundle.patch` 且自带的 patch 恰好贡献一行（`name` = 包名、
 `id` = 宿主半导出的 `name`，并随 `files` 发布）——没有这些声明，
 `dsh plugin add` 只会把包装成普通依赖、静默不挂载；同时以最小假 ctx 跑遍宿主
