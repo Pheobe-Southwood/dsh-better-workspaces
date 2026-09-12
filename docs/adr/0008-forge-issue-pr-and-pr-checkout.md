@@ -216,3 +216,37 @@ PR 落在缓存页之外），插件不持有 token。
 - 本 ADR 记录的是「在官方 UI 内部借用缝隙」的又一处实例（前例见 ADR 0001、0006）：
   缝隙是官方的内部结构而非承诺，界面回归时的降级表现应是「控件/引用不可用」，不是
   输入框损坏。
+
+## Amendment 1（2026-09-11）：全局 forge 身份与提交时新鲜度
+
+本修订取代 B 中的「`ref: 编号`/词表」以及 D 中依赖 cwd 隐式解析仓库的部分。
+
+1. 新引用的 owner-scoped `ref` 是一个版本化标量，编码
+   `{host, owner, repo, kind, number}`；host/owner/repo 规范化后共同参与身份。chip 的界面标签
+   仍显示 `#N`；`codec.clipboardText` 改为带 `[[dsh-bw1:…]]` owner 标记的 canonical Forge URL，使官方纯文本
+   持久化和 Workspace 草稿转移也不丢失身份，不会把用户普通粘贴的 URL 据为插件引用，也不会唤醒 `@` 菜单。Issue 与 PR、github.com 与 GHES、
+   同号跨仓条目不再共用缓存键。旧的纯数字 ref 只有在 Host 同时探测 Issue/PR 后得到唯一结果
+   才继续解析；格式损坏、结果歧义、仓库变化或 kind 不匹配时阻断发送，绝不猜测另一个条目。
+2. 列表行只供界面显示。`codec.serialize` 每次提交都带完整身份重新请求 `/pull`，Host 先
+   从获授权 cwd 重建仓库身份并与 ref 比较，再向 `gh` 请求明确 kind；列表缓存不能代替这次
+   刷新。这样 chip 仍显示插入时标题，模型得到的 URL、Base/Head 与正文则是提交时版本。
+3. DSH 的持久化 store 只保存 chip 的剪贴板投影并在重挂载或 Workspace 切换时恢复为普通
+   文本。投影因此使用自描述 canonical URL；控件在 layout 阶段解析完整 URL、先通过
+   `conversation.blocks` 冻结 composer，再以同一份 live snapshot 的 `draftRev` CAS 反向重绑。
+   Session sidecar 只用于保留插入时标题和精确点位，不再是身份正确性的单点依赖；缺失或写满时
+   仍可由 URL 恢复。畸形/截断的 Forge URL、校验失败或 CAS 失败均保持原草稿并持续 fail-closed，
+   用户编辑掉畸形标记后才解除 block。
+4. forge 身份贯穿 Host：认证缓存按 host 分区，GraphQL 批次按 host 分组且显式
+   `gh api --hostname`，所有 list/view/create/merge 命令使用
+   `--repo HOST/OWNER/REPO`；状态与列表缓存也包含 canonical repository key。单侧列表失败
+   以 `partial` 明示并保留另一侧条目，不再伪装成完整 authenticated 结果。
+5. `pr-checkout` 的权威身份来自 Host 重新读取的 PR 详情：base 仓库身份、PR number、原始
+   head ref 与 head OID 一并写入元数据。后续徽章/merge 通过记录的 PR number 查询，不从
+   owner 前缀或 `-1` 后缀的本地分支名反推。检出只接受与 base 仓库匹配的 remote，并要求
+   `refs/pull/N/head` 的实际 SHA 与已验证 head OID 完全一致；同号 upstream ref 不能成为兜底。
+6. forge 按钮与 serializer 在同一个 `inputTriggers` 子 Fiber 内注册/销毁，来源补齐必需的
+   `onPick`。服务未就绪时两者都不存在，因而不可能先插入一个没有 serializer 的 chip。
+7. 修订前创建的 PR worktree 没有仓库身份；PR number + SHA 不能在共享 commit 的 fork 之间证明
+   仓库来源。因此旧记录的 PR 徽章、Create/Merge/Auto-merge 均 fail-closed，需重新检出 PR，不能
+   自动“迁移”到当前 origin。GHES 若 Git transport hostname 与 API hostname 不同也不做猜测；
+   需让受权 remote 使用 API hostname（公共 `ssh.github.com:443` 是唯一内建且有官方定义的映射）。

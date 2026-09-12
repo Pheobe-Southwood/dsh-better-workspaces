@@ -27,6 +27,7 @@ try {
     createElement: (...args) => ({ type: args[0], props: args[1], children: args.slice(2) }),
     useState: (value) => [value, () => {}],
     useEffect: () => {},
+    useLayoutEffect: () => {},
     useRef: (value) => ({ current: value }),
     useCallback: (fn) => fn,
     useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
@@ -214,7 +215,20 @@ assert.equal(typeof forgeSource.codec.serialize, 'function');
    official TriggerChar union is '/' | '@', and `trigger` is the lexicon's key
    domain). Keeping them different is the fix: an "@N" chip woke the official
    attachment/reference menu on the same keystroke. */
-assert.equal(forgeSource.codec.clipboardText('7'), '#7');
+const forgeRef = mod.__bwTest.encodeForgeRef({ host: 'github.com', owner: 'acme', repo: 'widget', kind: 'change_request', number: 7 });
+assert.ok(forgeRef.startsWith('bw1'));
+assert.deepEqual(mod.__bwTest.decodeForgeRef(forgeRef), {
+  version: 1, host: 'github.com', owner: 'acme', repo: 'widget', kind: 'change_request', number: 7,
+});
+assert.equal(forgeSource.codec.clipboardText(forgeRef), '[[dsh-bw1:https://github.com/acme/widget/pull/7]]');
+const issueRef = mod.__bwTest.encodeForgeRef({ host: 'github.com', owner: 'acme', repo: 'widget', kind: 'issue', number: 7 });
+const enterpriseRef = mod.__bwTest.encodeForgeRef({ host: 'ghe.example.test', owner: 'acme', repo: 'widget', kind: 'change_request', number: 7 });
+assert.notEqual(issueRef, forgeRef, 'issue and PR #7 do not collide');
+assert.notEqual(enterpriseRef, forgeRef, 'enterprise and public repositories do not collide');
+assert.equal(mod.__bwTest.decodeForgeRef('bw1not-hex'), null, 'malformed versioned refs fail closed');
+assert.equal(forgeSource.codec.clipboardText('7'), '#7', 'legacy numeric refs retain their projection');
+await assert.rejects(forgeSource.codec.serialize('7'), /Forge|无法读取|Could not read/i,
+  'legacy number-only refs fail closed because they carry no repository provenance');
 /* NOT `candidates === undefined`: the controller's roster loop calls
    `candidates(...)` synchronously on every `@` hit, so an omitted hook throws
    inside the loop and every source ordered after this one stops answering.
@@ -230,19 +244,60 @@ for (const source of triggerSources) {
   assert.equal(typeof pending.then, 'function', `${source.name}: candidates must return a promise`);
   assert.ok(Array.isArray(await pending), `${source.name}: candidates must resolve to a list`);
 }
-assert.equal(typeof forgeSource.lexicon, 'function', 'the lexicon decorates a persisted #N-shaped draft');
-assert.ok(Array.isArray(forgeSource.lexicon()), 'lexicon answers a roll, never undefined');
-/* A roll that never changes after warm would leave a freshly attached ref
-   undecorated, so the source must publish its invalidation channel too. */
-assert.equal(typeof forgeSource.subscribeLexicon, 'function', 'the lexicon roll announces its changes');
-let lexiconPings = 0;
-const offLexicon = forgeSource.subscribeLexicon({ sessionId: 's-1' }, () => { lexiconPings += 1; });
-assert.equal(typeof offLexicon, 'function', 'subscribing the roll returns its disposer');
-offLexicon();
-assert.equal(lexiconPings, 0, 'nothing is announced before anything is attached');
-assert.deepEqual(forgeSource.lexicon(), [], 'nothing is attachable until something was attached');
+assert.equal(typeof forgeSource.onPick, 'function', 'the trigger contract requires onPick');
+assert.equal(forgeSource.onPick({}), undefined, 'the picker is the source’s only insertion door');
+assert.equal(forgeSource.lexicon, undefined, 'a #N projection cannot be truthfully restored by the @ lexicon scanner');
 assert.equal(await forgeSource.codec.serialize('7', { aborted: false }).then(() => 'no', () => 'threw'), 'threw',
   'a ref without a repository fails loudly instead of expanding to nothing');
+const originalFetch = globalThis.fetch;
+let detailUrl = null;
+sessionSnapshot = { byId: { 's-1': { cwd: '/repo-a' } }, ids: ['s-1'], current: 's-1', phase: 'ready' };
+mod.__bwTest.forgeItems.set(forgeRef, { title: 'stale list row' });
+globalThis.fetch = async (url) => {
+  detailUrl = String(url);
+  return { json: async () => ({ ok: true, item: {
+    host: 'github.com', owner: 'acme', repo: 'widget', kind: 'change_request', number: 7,
+    title: 'Fresh PR detail', url: 'https://github.com/acme/widget/pull/7', body: 'fresh body',
+    baseRefName: 'main', headRefName: 'feature',
+  } }) };
+};
+try {
+  const modelText = await forgeSource.codec.serialize(forgeRef, { aborted: false });
+  assert.match(modelText, /Fresh PR detail/);
+  assert.match(modelText, /Base: main/);
+  assert.match(modelText, /Head: feature/);
+  assert.match(modelText, /fresh body/);
+  assert.match(detailUrl, /cwd=%2Frepo-a/);
+  assert.match(detailUrl, /kind=change_request/);
+  assert.match(detailUrl, /host=github\.com/);
+  assert.match(detailUrl, /owner=acme/);
+  assert.match(detailUrl, /repo=widget/);
+} finally {
+  globalThis.fetch = originalFetch;
+  sessionSnapshot = { byId: {}, ids: [], current: undefined, phase: 'ready' };
+}
+
+sessionSnapshot = {
+  byId: { notes: { cwd: '/notes' }, owner: { cwd: '/repo-a' } },
+  ids: ['notes', 'owner'], current: 'notes', phase: 'ready',
+};
+const triedCwds = [];
+globalThis.fetch = async (url) => {
+  const parsed = new URL(String(url), 'http://local');
+  const cwd = parsed.searchParams.get('cwd');
+  triedCwds.push(cwd);
+  return { json: async () => cwd === '/repo-a'
+    ? ({ ok: true, item: { host: 'github.com', owner: 'acme', repo: 'widget', kind: 'change_request', number: 7,
+        title: 'Owner Session PR', url: 'https://github.com/acme/widget/pull/7', body: '', baseRefName: 'main', headRefName: 'feature' } })
+    : ({ ok: false, authState: 'no_remote', message: 'not a git repository' }) };
+};
+try {
+  assert.match(await forgeSource.codec.serialize(forgeRef, { aborted: false }), /Owner Session PR/);
+  assert.deepEqual(triedCwds, ['/notes', '/repo-a'], 'a non-Forge current Session does not mask the owning repository');
+} finally {
+  globalThis.fetch = originalFetch;
+  sessionSnapshot = { byId: {}, ids: [], current: undefined, phase: 'ready' };
+}
 assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
 
 /* ---------------- the composer control actually MOUNTS ---------------- */
@@ -374,7 +429,7 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
   const originalGet = ctx.get?.bind(ctx);
   ctx.get = (name) => (name === 'conversation' ? conversation : originalGet ? originalGet(name) : undefined);
 
-  const item = { number: 7, kind: 'change_request', title: 'wire up the picker', state: 'OPEN' };
+  const item = { host: 'github.com', owner: 'acme', repo: 'widget', number: 7, kind: 'change_request', title: 'wire up the picker', state: 'OPEN' };
   const detectEnd = mod.__bwTest.referenceDetectEnd;
 
   // (a) the projection contract: occurrence ranges are CLIPBOARD coordinates,
@@ -455,7 +510,7 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     notify() { multiNotices += 1; },
   };
   const three = [803, 777, 42].map((number) => mod.__bwTest.attachForgeReference({
-    item: { number, kind: 'issue', title: `issue ${number}` },
+    item: { host: 'github.com', owner: 'acme', repo: 'widget', number, kind: 'issue', title: `issue ${number}` },
     sessionInput: multiShell,
     fallbackInput: null,
   }));
@@ -465,7 +520,9 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     { start: 2, end: 2, draftRev: 1 },
     { start: 4, end: 4, draftRev: 2 },
   ], 'each pick uses the exact live detect end, including the third');
-  assert.equal(multiState.draft, '#803 #777 #42 ', 'all three stay in chip-shaped clipboard form');
+  assert.equal(multiState.draft, multiState.occurrences.map((entry) => entry.clipboardText + ' ').join(''),
+    'all three stay in self-identifying chip persistence form');
+  assert.deepEqual(multiState.occurrences.map((entry) => mod.__bwTest.decodeForgeRef(entry.ref).number), [803, 777, 42]);
   assert.equal(multiState.occurrences.length, 3, 'all three are real chip occurrences');
   assert.equal(multiSetDraftCalls, 0, 'the attach path never expands the draft through setDraft');
   assert.equal(multiNotices, 0, 'successful inserts stay quiet');
@@ -483,8 +540,10 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
     assert.deepEqual(span, { start: 5, end: 5, draftRev: 9 },
       'the span carries the shell’s live rev (a stale render-time rev would fail the CAS)');
     assert.equal(ref.source, 'better-workspaces-forge', 'the reference names our trigger source');
-    assert.equal(ref.ref, '7', 'and carries the picked number');
-    assert.equal(ref.clipboardText, '#7', 'the chip shows "#7" so it cannot wake the "@" menu');
+    assert.deepEqual(mod.__bwTest.decodeForgeRef(ref.ref), {
+      version: 1, host: 'github.com', owner: 'acme', repo: 'widget', kind: 'change_request', number: 7,
+    }, 'and carries the full immutable forge identity');
+    assert.equal(ref.clipboardText, '[[dsh-bw1:https://github.com/acme/widget/pull/7]]', 'persistence carries a readable canonical identity without using the @ trigger');
     assert.ok(ref.label.includes('#7'), `the chip label names the item: ${ref.label}`);
     return true;
   };
@@ -494,7 +553,100 @@ assert.equal(dictionaries.dicts.zh['forge.addIssuePr'], '添加 issue 或 PR');
   assert.equal(setDraftCalls, 0, 'the atomic chip path never mutates the draft as plain text');
   assert.equal(notified, null, 'and a successful attach stays quiet');
 
-  // (e) a refused chip is atomic: draft unchanged, no setDraft, visible notice.
+  // (e) a persisted clipboard projection is rebound to the exact canonical ref.
+  const sidecarStorage = new Map();
+  const priorLocalStorage = globalThis.localStorage;
+  globalThis.localStorage = {
+    getItem: (key) => sidecarStorage.get(key) ?? null,
+    setItem: (key, value) => sidecarStorage.set(key, value),
+    removeItem: (key) => sidecarStorage.delete(key),
+  };
+  try {
+    const ref = mod.__bwTest.encodeForgeRef(item);
+    const projection = mod.__bwTest.forgeClipboardText(ref);
+    assert.equal(mod.__bwTest.embeddedForgeDraft(projection + ',').references[0].ref, ref,
+      'adjacent punctuation stays outside the canonical URL identity');
+    assert.equal(mod.__bwTest.embeddedForgeDraft('[[dsh-bw1:https://github.com/acme/widget/pull/nope]]').invalid, true);
+    assert.equal(mod.__bwTest.embeddedForgeDraft('[[dsh-bw1:https://github.com/acme/widget/issues/').invalid, true);
+    assert.equal(mod.__bwTest.embeddedForgeDraft('https://github.com/acme/widget/issues/'), null,
+      'ordinary pasted Forge URLs are never claimed by this source');
+    const malformedProjection = '[[dsh-bw1:https://github.com/acme/widget/pull/nope]]';
+    const malformedRecord = mod.__bwTest.embeddedForgeDraft(malformedProjection);
+    assert.equal(mod.__bwTest.forgeClipboardText(malformedRecord.references[0].ref), malformedProjection,
+      'a malformed owner marker can become a deletable invalid chip without losing its text');
+    const liveInput = { draft: projection, draftRev: 1, occurrences: [{
+      source: 'better-workspaces-forge', ref, offset: 0, length: projection.length,
+      label: 'PR #7 wire up the picker', clipboardText: projection,
+    }] };
+    mod.__bwTest.writeForgeDraftSidecar('persisted', liveInput);
+    const invalidRef = malformedRecord.references[0].ref;
+    const mixedStoredDraft = projection + ' ' + malformedProjection;
+    mod.__bwTest.writeForgeDraftSidecar('mixed-stored', {
+      draft: mixedStoredDraft,
+      occurrences: [
+        liveInput.occurrences[0],
+        { source: 'better-workspaces-forge', ref: invalidRef, offset: projection.length + 1,
+          length: malformedProjection.length, label: 'broken', clipboardText: malformedProjection },
+      ],
+    });
+    assert.equal(mod.__bwTest.readForgeDraftSidecar('mixed-stored').references.length, 2,
+      'sidecar persistence retains invalid owned chips alongside valid references');
+    sessionInput.snapshot = { draft: projection, draftRev: 2, phase: 'plain', occurrences: [] };
+    let rebound = null;
+    const reboundShell = {
+      rev: 2,
+      insertReference: (reference, span) => { rebound = { reference, span }; return true; },
+    };
+    assert.equal(mod.__bwTest.settleForgeDraftSidecar('persisted', {
+      draft: projection, draftRev: 2, occurrences: [],
+    }, reboundShell), true);
+    assert.equal(rebound.reference.ref, ref);
+    assert.equal(rebound.reference.clipboardText, projection);
+    assert.deepEqual(rebound.span, { start: 0, end: projection.length, draftRev: 2 });
+
+    rebound = null;
+    sidecarStorage.clear();
+    assert.equal(mod.__bwTest.settleForgeDraftSidecar('transferred', {
+      draft: projection, draftRev: 3, occurrences: [],
+    }, reboundShell), true, 'a Workspace-transferred canonical URL restores without a source-Session sidecar');
+    assert.equal(rebound.reference.ref, ref);
+
+    rebound = null;
+    assert.equal(mod.__bwTest.settleForgeDraftSidecar('malformed', {
+      draft: malformedProjection, draftRev: 4, occurrences: [],
+    }, reboundShell), true, 'a malformed owned marker is rebound as an invalid, user-deletable chip');
+    assert.match(rebound.reference.ref, /^bwi/);
+    assert.equal(rebound.reference.clipboardText, malformedProjection);
+
+    const issueItem = { ...item, kind: 'issue', number: 8, url: 'https://github.com/acme/widget/issues/8' };
+    const issueRef = mod.__bwTest.encodeForgeRef(issueItem);
+    const issueProjection = mod.__bwTest.forgeClipboardText(issueRef);
+    const mixedDraft = projection + ' ' + issueProjection;
+    rebound = null;
+    assert.equal(mod.__bwTest.settleForgeDraftSidecar('mixed', {
+      draft: mixedDraft, draftRev: 5, occurrences: [{
+        source: 'better-workspaces-forge', ref, offset: 0, length: projection.length,
+        label: 'PR #7 wire up the picker', clipboardText: projection,
+      }],
+    }, reboundShell), true, 'plain owned markers are reconciled even when another Forge chip is already live');
+    assert.equal(rebound.reference.ref, issueRef);
+    assert.deepEqual(rebound.span, { start: 2, end: 2 + issueProjection.length, draftRev: 5 });
+
+    const fileProjection = '/tmp/very-long-file.txt';
+    rebound = null;
+    assert.equal(mod.__bwTest.settleForgeDraftSidecar('cross-source', {
+      draft: fileProjection + ' ' + projection, draftRev: 6, occurrences: [{
+        source: 'files', ref: '/tmp/very-long-file.txt', offset: 0, length: fileProjection.length,
+        label: 'very-long-file.txt', clipboardText: fileProjection,
+      }],
+    }, reboundShell), true, 'all reference sources participate in clipboard-to-detect coordinate shrink');
+    assert.deepEqual(rebound.span, { start: 2, end: 2 + projection.length, draftRev: 6 });
+  } finally {
+    if (priorLocalStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = priorLocalStorage;
+  }
+
+  // (f) a refused chip is atomic: draft unchanged, no setDraft, visible notice.
   sessionInput.insertReference = () => false;
   notified = null;
   assert.equal(mod.__bwTest.attachForgeReference({ item, sessionInput, fallbackInput: null }), false,
@@ -581,21 +733,11 @@ assert.match(
   'and it actually asks for that service',
 );
 
-/* The chip's VISIBLE marker is "#N", never "@N". "@" is the wake-up char for
-   the official attachment/reference sources, so an "@N" projection put both
-   menus on the same keystroke. This is a static guard on purpose: the display
-   form is produced in two places (the insert payload and the codec projection)
-   and a behavioural test only covers whichever one it happens to exercise. */
-assert.match(
-  codeOnly,
-  /clipboardText:\s*["']#["']/,
-  'the chip payload projects as "#N"',
-);
-assert.match(
-  codeOnly,
-  /clipboardText:\s*\(ref\)\s*=>\s*["']#["']/,
-  'and so does the codec projection',
-);
+/* The chip LABEL remains "#N", never "@N". Its clipboard/persistence form is
+   a readable canonical Forge URL so DSH's plain-text store and Workspace draft
+   transfer cannot erase identity, without waking the @ trigger. */
+assert.match(codeOnly, /const route = identity\.kind/, 'the codec derives a kind-specific URL route');
+assert.match(codeOnly, /https:\/\/\$\{identity\.host\}/, 'canonical persistence refs retain the Forge host');
 assert.ok(
   !/clipboardText:\s*["']@["']/.test(codeOnly),
   'no reference projection may start with "@" again',
@@ -612,7 +754,7 @@ assert.match(
    and prevent the old coordinate formula from being reintroduced elsewhere. */
 assert.match(
   codeOnly,
-  /if\s*\(landed\)\s*setOpen\(false\)/,
+  /if\s*\(landed\)\s*\{[^}]*setOpen\(false\)/,
   'the picker closes only after a chip actually lands',
 );
 assert.ok(
