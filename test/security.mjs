@@ -322,7 +322,7 @@ try {
   assert.equal((await request('/worktrees', jsonInit({ cwd: repo, base: 'main', intent: 'branch-off', branchName: '--detach' }))).status, 422);
   assert.equal((await request('/worktrees', jsonInit({
     cwd: repo,
-    pull: { number: 1, headRef: 'safe-head', baseRef: `--output=${sentinel}` },
+    pull: { host: 'github.com', owner: 'safe', repo: 'repo', number: 1, headRef: 'safe-head', baseRef: `--output=${sentinel}` },
   }))).status, 422);
   assert.equal(existsSync(sentinel), false);
 
