@@ -209,3 +209,7 @@ _Avoid_: npm 包（那是更宽的概念）
 从只声明 `dsh.client` 的旧版本升级时，必须删掉 profile 层里手写的那一行挂载行。`insert` 是原样追加、不按 id 去重，重复 id 由 loader 抛 `duplicate loader entry id` 并 fail-loud —— 两个来源不是「无害的重复」，而是起不来。
 _Avoid_: 兼容处理
 
+**回环受信代理（loopback-trusted reverse proxy）**：
+在浏览器与本插件之间终止 TLS 的本机反代（如 cloudflared）。POST 同源门禁 `sameOrigin` 先按 socket 事实直接比对 `Origin` 与 `Host`/协议；仅当直接比对失败、TCP 对端属于 `127.0.0.0/8` 或 `::1`、且请求至少带一个 `X-Forwarded-Proto`/`X-Forwarded-Host` 时，才用转发头补出浏览器所见协议与主机名再比对。远端对端、无转发头的回环直连、以及 `X-Forwarded-*` 与 `Origin` 不一致的请求一律维持拒绝。浏览器按 Fetch 规范禁设 `X-Forwarded-*`（forbidden header name），因此该信任不扩大 CSRF 攻击面（ADR 0012）。
+_Avoid_: 无条件信任 `X-Forwarded-*`、用 `X-Forwarded-For` 判断信任（那是客户端可伪造的链）
+

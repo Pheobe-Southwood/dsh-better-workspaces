@@ -219,6 +219,26 @@ so cold boot waits for both the HTTP surface and the registry-backed authorizati
 source instead of racing either one (ADRs 0005 and 0010) — if the UI
 is missing after a restart, run the self-check in the ops section below.
 
+### Reverse proxy and Cloudflare Tunnel
+
+The API's POST gate is same-origin by design (ADR 0012): an `Origin` must match
+the `Host` header and the scheme the *browser* used. A TLS-terminating tunnel
+(Cloudflare Tunnel, or any `https` reverse proxy) speaks plain HTTP to this
+server, so the browser-visible scheme can only come from the proxy itself:
+
+- run the tunnel client on the same host, point it at `http://127.0.0.1:3080`,
+  and leave the `Host` header untouched (cloudflared's default — do **not** pass
+  `--http-host-header`);
+- the Cloudflare edge supplies `X-Forwarded-Proto: https`, which the plugin
+  honours **only for loopback peers**; a request arriving from a non-loopback
+  address can never vouch for its own scheme or host;
+- if a proxy rewrites `Host`, it must also state the browser-visible name in
+  `X-Forwarded-Host`.
+
+Requests without an `Origin`, opaque (`Origin: null`) ones, and any request whose
+`Sec-Fetch-Site` is not `same-origin` stay rejected — embedding the GUI in a
+cross-site frame is not supported.
+
 ## Development and quality gates
 
 Repository development uses npm and the committed lockfile; `pnpm` above is a

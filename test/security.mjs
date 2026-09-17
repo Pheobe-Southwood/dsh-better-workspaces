@@ -22,7 +22,7 @@ import { dirname, join } from 'node:path';
 const sandbox = mkdtempSync(join(tmpdir(), 'dsh-bw-security-'));
 process.env.DSH_HOME = join(sandbox, 'dsh-home');
 
-const { API_PREFIX, createApi } = await import('../lib/api.js');
+const { API_PREFIX, createApi, firstForwarded, isLoopbackPeer, sameOrigin } = await import('../lib/api.js');
 const { createWorkspaceAuthorizer } = await import('../lib/authorize.js');
 const { archiveWorktree, createWorktree, metadataPathFor, repoWorktreesRoot, validateManagedWorktree } = await import('../lib/worktree.js');
 const { createGitStateHub } = await import('../lib/state.js');
@@ -265,6 +265,68 @@ try {
   })).status, 403);
   assert.equal((await request('/snapshots', jsonInit({}, { Origin: 'https://evil.example' }))).status, 403);
   assert.equal((await request('/snapshots', jsonInit({}, { 'Sec-Fetch-Site': 'cross-site' }))).status, 403);
+
+  // A TLS-terminating tunnel (Cloudflare Tunnel et al.) talks plain HTTP to
+  // this server, so the browser-visible scheme can only come from a loopback
+  // proxy's X-Forwarded-Proto. Direct/remote callers keep the strict socket
+  // check, and the host must still match.
+  const tunnelOrigin = `https://127.0.0.1:${server.address().port}`;
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: tunnelOrigin,
+  }))).status, 403, 'an https Origin without a forwarded header stays rejected');
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: tunnelOrigin, 'X-Forwarded-Proto': 'https',
+  }))).status, 200, 'a loopback proxy may vouch for the terminating scheme');
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: tunnelOrigin, 'X-Forwarded-Proto': 'https, http',
+  }))).status, 200, 'the first forwarded protocol entry is the client-facing one');
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: 'https://evil.example', 'X-Forwarded-Proto': 'https',
+  }))).status, 403, 'a forwarded scheme never bypasses the host comparison');
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: tunnelOrigin, 'X-Forwarded-Proto': 'https', 'X-Forwarded-Host': 'evil.example',
+  }))).status, 403, 'a forwarded host must match the Origin host');
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: 'https://evil.example', 'X-Forwarded-Proto': 'https', 'X-Forwarded-Host': 'evil.example',
+  }))).status, 200, 'a loopback proxy that rewrites Host may vouch for the browser-visible host too');
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: 'https://tunnel.example', 'X-Forwarded-Proto': 'https',
+  }))).status, 403, 'a proxy-rewritten Host without a forwarded host stays rejected');
+  assert.equal((await request('/snapshots', jsonInit({ cwds: [repo] }, {
+    Origin: `http://127.0.0.1:${server.address().port}`, 'X-Forwarded-Proto': 'https',
+  }))).status, 200, 'forwarded headers never break an already-valid direct same-origin request');
+
+  // Unit matrix: only loopback peers inherit the forwarded-header trust.
+  const forged = {
+    headers: { origin: 'https://evil.example', host: 'evil.example', 'x-forwarded-proto': 'https', 'x-forwarded-host': 'evil.example' },
+  };
+  for (const remoteAddress of ['203.0.113.9', '10.1.2.3', '192.168.1.5', undefined, '::2']) {
+    assert.equal(sameOrigin({ ...forged, socket: { remoteAddress } }), false,
+      `non-loopback peer ${String(remoteAddress)} cannot vouch for forwarded headers`);
+  }
+  for (const remoteAddress of ['127.0.0.1', '127.0.0.2', '::1', '::ffff:127.0.0.1']) {
+    assert.equal(isLoopbackPeer({ remoteAddress }), true, `${remoteAddress} is a loopback peer`);
+    assert.equal(sameOrigin({ ...forged, socket: { remoteAddress } }), true,
+      `loopback peer ${remoteAddress} vouches for self-consistent forwarded headers`);
+    assert.equal(sameOrigin({
+      headers: { ...forged.headers, 'x-forwarded-host': 'other.example' },
+      socket: { remoteAddress },
+    }), false, `loopback peer ${remoteAddress} still needs the forwarded host to match`);
+  }
+  assert.equal(isLoopbackPeer({ remoteAddress: '128.0.0.1' }), false, '127/8 must not be prefix-matched loosely');
+  assert.equal(isLoopbackPeer({}), false, 'a socket without a remote address is untrusted');
+  assert.equal(firstForwarded('  HTTPS , http '), 'https', 'forwarded values are trimmed and lowercased');
+  assert.equal(firstForwarded(''), null, 'an empty forwarded value carries no context');
+  assert.equal(firstForwarded(undefined), null, 'a missing forwarded value carries no context');
+  assert.equal(sameOrigin({ headers: { host: 'evil.example', 'x-forwarded-proto': 'https' }, socket: { remoteAddress: '127.0.0.1' } }), false,
+    'a missing Origin is rejected even behind a loopback proxy');
+  assert.equal(sameOrigin({ headers: { origin: 'null', host: 'evil.example', 'x-forwarded-proto': 'https' }, socket: { remoteAddress: '127.0.0.1' } }), false,
+    'an opaque Origin is rejected even behind a loopback proxy');
+  assert.equal(sameOrigin({
+    headers: { origin: 'https://evil.example', host: 'evil.example' },
+    socket: { remoteAddress: '127.0.0.1' },
+  }), false, 'a loopback peer without any forwarded header keeps the strict socket check');
+
   assert.equal((await request('/snapshots', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: '{',
   })).status, 400);
