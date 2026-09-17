@@ -41,7 +41,7 @@ _Avoid_: 临时目录、副本
 _Avoid_: 全局锁、worktree 锁
 
 **创建事务日志（create journal）**：
-仓库专属受管根先以 fsync owner record 绑定 main repo dev/inode；`git worktree add` 前再写入 fsync pending，包含 txId、路径、分支和不可变创建 OID。prepared 阶段不声称拥有未来分支；仅在 Git row/branch/HEAD 与 path/gitdir inode 全部证明后升级 added。元数据提交成功后清除；进程若在中间退出，自动恢复绝不删除仍存在的 path 或 row（普通 status 看不见 ignored/事后文件），只在两者都已由人工移除后按 OID CAS 删除本次拥有的分支；证据不足宁可保留，也会清扫插件专属 PR 临时 ref。
+仓库专属受管根先以 fsync owner record 绑定 main repo dev/inode；`git worktree add` 前再写入 fsync pending，包含 txId、路径、分支和不可变创建 OID。prepared 阶段不声称拥有未来分支；仅在 Git row/branch/HEAD 与 path/gitdir inode 全部证明后升级 added。元数据提交成功后清除；进程若在中间退出，自动恢复绝不删除仍存在的 path 或 row（普通 status 看不见 ignored/事后文件），只在两者都已由人工移除后按 OID CAS 删除本次拥有的分支；证据不足宁可保留，也会清扫插件专属 PR 临时 ref。owner record 缺失只说明这是一个**遗留受管根**（早于该记录诞生的根），解析事务前必须先经 `prepareManagedRoot` 认领；只有记录存在但 dev/inode 不符才是「仓库被替换」，必须拒绝。
 _Avoid_: worktree 元数据、操作日志
 
 **创建请求收据（creation receipt）**：

@@ -64,3 +64,22 @@
 - Linux `/proc` 成为稳定 Git API 的明确平台前提；换取的是读取和写入都不再依赖可被路径 ABA 替换的元数据发现。
 - Git helper 的调用上下文成为能力的一部分，测试必须覆盖并发队列饱和、外置 Git dir 和环境变量清洗。
 - Hub 更新/停止更快且不会把旧会话结果投射到新 cwd，但缓存和 SSE 超限时会主动淘汰或断开而不是无限保留。
+
+## Amendment 3（2026-09-17）：遗留受管根的事务解析顺序
+
+### 新背景
+
+owner record 是本 ADR 引入的（提交 `6e509f2`，2026-09-11）。在此之前诞生的受管根没有该文件，而**客户端每次创建都携带持久化 txId**（幂等重试）。POST /worktrees 的顺序是：先 `findWorktreeCreation` 事务预检，再进入 `createWorktree`；但前者调用 `verifyRepoOwner(..., { create: false })`，对缺少 owner record 的根直接返回 `conflict/repo-owner-changed`，被映射为 409 `transaction_conflict`。真正会认领遗留根的 `prepareManagedRoot`（`create: true`）位于 `createWorktree` 内部，永远轮不到执行 —— 于是「有受管历史但无 owner record」的仓库**永久无法创建**，而从未建过 worktree 的仓库（受管根不存在）不受影响。这个缺陷此前被同源门禁的 403 掩盖（请求根本没进入业务层），直到隧道场景放行后才暴露。
+
+### 补充决策
+
+1. 事务解析（`findWorktreeCreation`）保持只读、`create: false` 的严格语义：它必须能对「存在但身份不符」的根失败关闭，不得由解析器本身写入状态。
+2. 任何以创建为目的、且在创建前解析事务的入口，必须先调用导出的 `prepareManagedRoot`：owner record 缺失即按既有语义认领（写入当前 main repo 的 dev/inode），记录存在但不符仍抛错拒绝。API 的预检路径与失败后的来源声明释放路径都遵守此顺序。
+3. `prepareManagedRoot` 因此成为公开的宿主 API 契约（供 api 层在 mutation gate 内、以授权后的稳定根调用），而不是 worktree 创建路径的内部细节。
+4. 回归测试固定该场景：预置一个只有目录、没有 owner record 的受管根，携带 txId 的创建必须 201 并写入记录，重试必须 200 replay。测试在移除引导调用时必须以 `transaction_conflict` + `reason: repo-owner-changed` 失败。
+
+### 补充后果
+
+- 升级后首次在某仓库创建 worktree 会自动认领其遗留受管根，无需人工补写 owner record；已存在的 worktree 与元数据不受影响。
+- 解析与认领的职责分离被显式化：只读解析器不再承担引导，引导必须发生在持有仓库 mutation gate 的写路径上。
+- 若仓库路径被真正替换（dev/inode 变化），行为与 Amendment 2 一致：拒绝，不认领。

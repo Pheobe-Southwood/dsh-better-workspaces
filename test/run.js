@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, statSync, renameSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, statSync, renameSync, readdirSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1909,6 +1909,88 @@ await test('api creation tx replays one durable Workspace and defers destructive
       workspaceId: rotated.workspaceId,
     });
     assert.equal(rotatedArchive.status, 200, JSON.stringify(await rotatedArchive.json()));
+  } finally {
+    await api.dispose();
+    await new Promise((resolveClose) => server.close(resolveClose));
+    await hub.dispose();
+  }
+});
+
+await test('api creation adopts a managed root that predates the owner record', async () => {
+  const legacyRepo = join(scratch, 'legacy-root-repo');
+  mkdirSync(legacyRepo);
+  git(legacyRepo, 'init', '-b', 'main');
+  git(legacyRepo, 'config', 'user.email', 'test@dsh.local');
+  git(legacyRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(legacyRepo, 'base.txt'), 'base\n');
+  git(legacyRepo, 'add', '-A');
+  git(legacyRepo, 'commit', '-m', 'base');
+  // A root that exists without an owner record is exactly the state every
+  // repository managed before that record was introduced is left in; the
+  // transaction pre-check must adopt it instead of reporting it as replaced.
+  const legacyRoot = await repoWorktreesRoot(legacyRepo);
+  mkdirSync(legacyRoot, { recursive: true });
+  const ownerFile = join(legacyRoot, '.repo-owner.json');
+  assert.equal(existsSync(ownerFile), false, 'the fixture starts as a legacy root');
+  const rows = [{ workspaceId: 'ws-legacy-main', path: legacyRepo, title: 'legacy main', sessionIds: [] }];
+  const hub = createGitStateHub({ onChange: () => {} });
+  const api = createApi(hub, {
+    workspaceRoots: () => rows.map((row) => row.path),
+    workspaceRows: () => rows,
+    worktreeWorkspaces: async () => rows.filter((row) => row.path !== legacyRepo),
+    createWorkspace: async (path, title) => {
+      const row = { workspaceId: `ws-legacy-${rows.length}`, path, title, sessionIds: [] };
+      rows.push(row);
+      return row;
+    },
+    deleteWorkspace: async () => true,
+  });
+  const server = http.createServer((req, res) => api.route.handler(req, res));
+  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+  const endpoint = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
+  const post = (path, body) => fetch(endpoint + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: new URL(endpoint).origin },
+    body: JSON.stringify(body),
+  });
+  try {
+    const response = await post('/worktrees', {
+      cwd: legacyRepo,
+      intent: 'branch-off',
+      branchName: 'legacy-adopted',
+      slug: 'legacy-adopted',
+      sourceTitle: 'Legacy source',
+      sourceSessionId: 'session-legacy-root-source',
+      txId: 'client-legacy-root-0001',
+    });
+    const created = await response.json();
+    assert.equal(response.status, 201, JSON.stringify(created));
+    assert.equal(created.ok, true);
+    assert.equal(existsSync(ownerFile), true, 'adoption writes the owner record');
+    const record = JSON.parse(readFileSync(ownerFile, 'utf8'));
+    const identity = statSync(realpathSync(legacyRepo));
+    assert.deepEqual(
+      { version: record.version, mainRepoRoot: record.mainRepoRoot, dev: record.dev, ino: record.ino },
+      { version: 1, mainRepoRoot: realpathSync(legacyRepo), dev: String(identity.dev), ino: String(identity.ino) },
+    );
+    const replayResponse = await post('/worktrees', {
+      cwd: legacyRepo,
+      intent: 'branch-off',
+      branchName: 'legacy-adopted',
+      slug: 'legacy-adopted',
+      sourceTitle: 'Legacy source',
+      sourceSessionId: 'session-legacy-root-source',
+      txId: 'client-legacy-root-0001',
+    });
+    const replay = await replayResponse.json();
+    assert.equal(replayResponse.status, 200, JSON.stringify(replay));
+    assert.equal(replay.replayed, true, 'the adopted root still replays one committed transaction');
+    const archiveResponse = await post('/worktrees/archive', {
+      path: created.path,
+      force: true,
+      workspaceId: created.workspaceId,
+    });
+    assert.equal(archiveResponse.status, 200, JSON.stringify(await archiveResponse.json()));
   } finally {
     await api.dispose();
     await new Promise((resolveClose) => server.close(resolveClose));
