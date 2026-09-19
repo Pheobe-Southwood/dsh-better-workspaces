@@ -3003,6 +3003,144 @@ await test('cleanup abandoned sweep: unreferenced+old only', async () => {
   for (const target of [wtFresh.path, wtBusy.path]) await archiveWorktree(target, { force: true });
 });
 
+/* ---------------- platform anchoring (ADR 0013) ---------------- */
+
+await test('platform anchoring helpers', async () => {
+  const stable = await import('../lib/stable.js');
+  try {
+    // Git path normalization is shape-driven, independent of the host platform
+    assert.equal(stable.normalizeGitPath('C:/Users/x/repo'), 'C:\\Users\\x\\repo');
+    assert.equal(stable.normalizeGitPath('//server/share/repo'), '\\\\server\\share\\repo');
+    assert.equal(stable.normalizeGitPath('C:\\Users\\x\\repo'), 'C:\\Users\\x\\repo');
+    assert.equal(stable.normalizeGitPath('/tmp/plain/repo'), '/tmp/plain/repo');
+    assert.equal(stable.normalizeGitPath('relative/path'), 'relative/path');
+    // win32 folds case in equivalence; POSIX stays strict
+    stable.__setPlatformForTests('win32');
+    assert.equal(stable.isDirfdPinSupported(), false);
+    assert.equal(stable.isFileExchangeSupported(), false);
+    assert.equal(stable.isWindows(), true);
+    assert.equal(stable.samePath('/a/B/c', '/A/b/C'), true);
+    assert.equal(stable.samePath('/a/B/c', '/a/B/d'), false);
+    stable.__setPlatformForTests(null);
+    assert.equal(stable.isDirfdPinSupported(), process.platform === 'linux');
+    assert.equal(stable.isFileExchangeSupported(), process.platform === 'linux');
+    assert.equal(stable.isWindows(), process.platform === 'win32');
+    assert.equal(stable.samePath('/a/B/c', '/A/b/C'), false);
+    assert.equal(stable.samePath('/a/b/c', '/a/b/c'), true);
+    // stat identity verification is the path-mode anchor proof
+    const info = statSync(repo);
+    assert.equal(await stable.verifyStatIdentity(repo, { dev: info.dev, ino: info.ino }), true);
+    assert.equal(await stable.verifyStatIdentity(repo, { dev: info.dev, ino: info.ino + 1 }), false);
+    assert.equal(await stable.verifyStatIdentity(join(repo, 'missing-anchor'), { dev: info.dev, ino: info.ino }), false);
+    assert.equal(await stable.verifyStatIdentity(repo, null), false);
+  } finally {
+    stable.__setPlatformForTests(null);
+  }
+});
+
+await test('path mode (simulated win32): discovery, worktree creation, picker, editor save', async () => {
+  const stable = await import('../lib/stable.js');
+  const pathRepo = join(scratch, 'path-mode-repo');
+  mkdirSync(pathRepo);
+  git(pathRepo, 'init', '-b', 'main');
+  git(pathRepo, 'config', 'user.email', 'test@dsh.local');
+  git(pathRepo, 'config', 'user.name', 'DSH Test');
+  writeFileSync(join(pathRepo, 'edit-me.txt'), 'before\n');
+  git(pathRepo, 'add', '-A');
+  git(pathRepo, 'commit', '-m', 'initial');
+  const hub = createGitStateHub({ onChange: () => {} });
+  const api = createApi(hub, {
+    workspaceRoots: () => [pathRepo],
+    resolveForgeIdentity: async () => ({ host: 'github.com', owner: 'test-owner', repo: 'test-repo' }),
+  });
+  const server = http.createServer((req, res) => api.route.handler(req, res));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}${API_PREFIX}`;
+  const originHeaders = { 'Content-Type': 'application/json', Origin: new URL(base).origin };
+  let created = null;
+  let stateHub = null;
+  try {
+    stable.__setPlatformForTests('win32');
+    // the composer GitHub picker's data source used to 503 off Linux
+    const pulls = await (await fetch(`${base}/pulls?cwd=${encodeURIComponent(pathRepo)}`)).json();
+    assert.equal(pulls.ok, true, JSON.stringify(pulls));
+    assert.equal(pulls.isGit, true);
+    const detect = await (await fetch(`${base}/detect?path=${encodeURIComponent(pathRepo)}`)).json();
+    assert.equal(detect.ok, true, JSON.stringify(detect));
+    assert.equal(detect.isGit, true);
+    assert.equal(detect.isLinkedWorktree, false);
+    const branches = await (await fetch(`${base}/branches?cwd=${encodeURIComponent(pathRepo)}`)).json();
+    assert.ok(branches.ok, JSON.stringify(branches));
+    assert.ok(branches.branches.some((branch) => branch.name === 'main' && branch.current));
+    // hero dropdown worktree creation — journal, link publication, add,
+    // postcondition and metadata all run in path mode
+    const create = await fetch(`${base}/worktrees`, {
+      method: 'POST',
+      headers: originHeaders,
+      body: JSON.stringify({ cwd: pathRepo, base: 'main', intent: 'branch-off', slug: 'path-mode-wt' }),
+    });
+    assert.equal(create.status, 201);
+    created = await create.json();
+    assert.equal(created.ok, true, JSON.stringify(created));
+    assert.ok(existsSync(join(created.path, 'edit-me.txt')));
+    const meta = await readMetadata(created.path);
+    assert.equal(meta.intent, 'branch-off');
+    assert.match(meta.branch, /^path-mode-wt/);
+    const worktreesListed = await (await fetch(`${base}/worktrees?cwd=${encodeURIComponent(created.path)}`)).json();
+    assert.ok(worktreesListed.items.some((item) => item.path === created.path && item.managed));
+    // task diff out of the managed worktree
+    const diff = await (await fetch(`${base}/diff?cwd=${encodeURIComponent(created.path)}&mode=task`)).json();
+    assert.equal(diff.ok, true, JSON.stringify(diff));
+    // editor save: fsync + CAS + rename replace (no exchange primitive off Linux)
+    const before = await (await fetch(`${base}/file?cwd=${encodeURIComponent(created.path)}&path=edit-me.txt`)).json();
+    assert.equal(before.kind, 'text');
+    const saved = await fetch(`${base}/file`, {
+      method: 'POST',
+      headers: originHeaders,
+      body: JSON.stringify({ cwd: created.path, path: 'edit-me.txt', content: 'after\n', baseSha1: before.sha1 }),
+    });
+    assert.equal(saved.status, 200, JSON.stringify(await saved.json()));
+    assert.equal(readFileSync(join(created.path, 'edit-me.txt'), 'utf8'), 'after\n');
+    assert.equal(readdirSync(created.path).some((name) => name.startsWith('.bw-') && name.endsWith('.tmp')), false,
+      'a path-mode save leaves no temporary file behind');
+    const conflict = await fetch(`${base}/file`, {
+      method: 'POST',
+      headers: originHeaders,
+      body: JSON.stringify({ cwd: created.path, path: 'edit-me.txt', content: 'clobber\n', baseSha1: before.sha1 }),
+    });
+    assert.equal(conflict.status, 409, 'stale CAS bases are rejected in path mode too');
+    assert.equal(readFileSync(join(created.path, 'edit-me.txt'), 'utf8'), 'after\n');
+    // hub snapshots compute through the path-mode anchor (stat identity, no pinning)
+    const pathModeAuthorizer = createWorkspaceAuthorizer({ workspaceRoots: () => [pathRepo] });
+    stateHub = createGitStateHub({
+      authorizeTarget: (cwd) => pathModeAuthorizer.authorize(cwd),
+      mutations: hostMutationCoordinator,
+      onChange: () => {},
+    });
+    const snapshot = await stateHub.snapshotFor(created.path, { fresh: true });
+    assert.equal(snapshot.branch, created.branch, JSON.stringify(snapshot));
+    assert.equal(snapshot.managed, true);
+    // archive also runs in path mode (no dirfd wrapper off Linux)
+    const archived = await archiveWorktree(created.path, { force: true });
+    assert.equal(archived.ok, true, JSON.stringify(archived));
+    assert.ok(!existsSync(created.path));
+    created = null;
+    // the real platform is restored and unaffected (dirfd mode back on Linux)
+    stable.__setPlatformForTests(null);
+    assert.equal(stable.currentPlatform(), process.platform);
+    const restoredDetect = await (await fetch(`${base}/detect?path=${encodeURIComponent(pathRepo)}`)).json();
+    assert.equal(restoredDetect.ok, true, JSON.stringify(restoredDetect));
+    assert.equal(restoredDetect.isGit, true);
+  } finally {
+    stable.__setPlatformForTests(null);
+    if (created) await archiveWorktree(created.path, { force: true }).catch(() => {});
+    await stateHub?.dispose().catch(() => {});
+    api.dispose();
+    server.close();
+    await hub.dispose();
+  }
+});
+
 rmSync(scratch, { recursive: true, force: true });
 console.log(results.join('\n'));
 if (process.exitCode) {

@@ -569,7 +569,42 @@ try {
   rmSync(plain, { recursive: true, force: true });
   renameSync(oldPlain, plain);
 
-  console.log('SECURITY: ALL PASS');
+// Path-mode saves (Windows/macOS, ADR 0013) must still break an in-workspace
+// hard-link alias instead of writing through the shared inode outside the
+// authorized root: the rename replace swaps the directory entry, and the CAS
+// re-check immediately before it keeps concurrent writers detectable.
+{
+  const stable = await import('../lib/stable.js');
+  const aliasRepo = join(sandbox, 'alias-path-mode');
+  initRepo(aliasRepo);
+  roots = [...roots, aliasRepo];
+  const outsideAlias = join(sandbox, 'outside-alias.txt');
+  const insideAlias = join(aliasRepo, 'inside-alias.txt');
+  writeFileSync(outsideAlias, 'alias-before\n');
+  linkSync(outsideAlias, insideAlias);
+  const aliasSha = createHash('sha1').update(readFileSync(insideAlias)).digest('hex');
+  stable.__setPlatformForTests('win32');
+  let savedAlias;
+  try {
+    savedAlias = await request('/file', jsonInit({
+      cwd: aliasRepo,
+      path: 'inside-alias.txt',
+      content: 'alias-after\n',
+      baseSha1: aliasSha,
+    }));
+  } finally {
+    stable.__setPlatformForTests(null);
+  }
+  assert.equal(savedAlias.status, 200, JSON.stringify(savedAlias.body));
+  assert.equal(readFileSync(insideAlias, 'utf8'), 'alias-after\n');
+  assert.equal(readFileSync(outsideAlias, 'utf8'), 'alias-before\n',
+    'the rename replace must break the alias, not mutate the outside inode');
+  assert.notEqual(statSync(insideAlias).ino, statSync(outsideAlias).ino);
+  assert.equal(readdirSync(aliasRepo).some((name) => name.startsWith('.bw-') && name.endsWith('.tmp')), false,
+    'path-mode save removes its owned temporary file before responding');
+}
+
+console.log('SECURITY: ALL PASS');
 } finally {
   api.dispose();
   await new Promise((resolve) => server.close(resolve));

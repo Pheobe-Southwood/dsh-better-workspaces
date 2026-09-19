@@ -107,7 +107,8 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
 ## Architecture
 
 - **Host** (`lib/index.js` → `git.js`, `worktree.js`, `autoname.js`,
-  `cleanup.js`, `forge.js`, `diff.js`, `actions.js`, `state.js`, `api.js`):
+  `cleanup.js`, `forge.js`, `diff.js`, `actions.js`, `state.js`, `api.js`,
+  with `stable.js` as the platform-anchoring layer):
   git-CLI primitives behind an 8-way concurrency scheduler; managed worktrees under
   `~/.dsh/worktrees/<8-char base36 sha256(mainRepoRoot)>/<slug>` with
   `<gitdir>/dsh-worktree/worktree.json` metadata and three creation intents —
@@ -138,13 +139,20 @@ See `CONTEXT.md` for the glossary and `docs/adr/` for the design records.
 ## Install (web profile)
 
 Prerequisites: `dsh` ≥ 0.1.5 with the `web` profile, Node.js ≥ 20.19,
-`pnpm` on `PATH`, Linux, `git` ≥ 2.31, and GNU coreutils `mv` with
-`--exchange` for atomic editor saves. Linux is required because stable
-repository mutations and file saves use `/proc` dirfd anchors; unsupported
-platforms—and systems without atomic exchange for saves—fail closed with HTTP
-503 instead of weakening the CAS guarantee. `gh` (authenticated) is optional — it
-enables the PR/checks features and the composer's issue/PR picker and PR checkout, and degrades
-gracefully when absent.
+`pnpm` on `PATH`, `git` ≥ 2.31, and a supported platform — Linux, Windows
+10+/Server 2016+ (Git for Windows), or macOS 13+. Platform anchoring is
+layered (ADR 0013): **Linux** pins every repository mutation and file save
+to verified dirfds through `/proc` and commits saves with
+`renameat2(RENAME_EXCHANGE)` (GNU coreutils `mv --exchange`; a Linux system
+without it still fails closed with HTTP 503 rather than weakening the
+exchange guarantee); **Windows and macOS** run the paseo path model —
+canonical paths for Git discovery, stat dev/ino identity checks at every
+operation boundary plus re-authorization after mutations, and file saves
+through fsync + sha1 compare-and-swap + atomic rename (paseo's file-editor
+semantics; the displaced-inode exchange rollback is a Linux-only extra).
+`gh` (authenticated) is optional — it enables the PR/checks features and the
+composer's issue/PR picker and PR checkout, and degrades gracefully when
+absent.
 
 **One command installs and mounts the plugin** (plain JS, no build step):
 

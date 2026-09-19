@@ -37,8 +37,12 @@ _Avoid_: 主目录、原目录
 _Avoid_: 临时目录、副本
 
 **仓库族变更门（repo-family mutation gate）**：
-同一主仓库及其全部 linked worktree 共享的宿主 FIFO 变更序列，键为授权阶段固定的规范主仓库根。create、archive、action、后台 fetch、自动改名和 Git 工作区文件保存都经此门；锁内同时复验目标根、主仓库根、worktree Git dir 与 common dir 的设备号/inode，并在 Linux 上以 dirfd 锚定读取和跨多条命令的目标，固定顺序是仓库门→文件 mutex。不同仓库仍可并行，Agent 或用户在插件外直接运行 Git 不受此门约束。
+同一主仓库及其全部 linked worktree 共享的宿主 FIFO 变更序列，键为授权阶段固定的规范主仓库根。create、archive、action、后台 fetch、自动改名和 Git 工作区文件保存都经此门；锁内同时复验目标根、主仓库根、worktree Git dir 与 common dir 的设备号/inode，Linux 上再以 dirfd 锚定读取和跨多条命令的目标（见平台锚定），固定顺序是仓库门→文件 mutex。不同仓库仍可并行，Agent 或用户在插件外直接运行 Git 不受此门约束。
 _Avoid_: 全局锁、worktree 锁
+
+**平台锚定（platform anchoring）**：
+稳定工作区操作的平台能力层（ADR 0013）：Linux 用目录 dirfd 经 `/proc/<pid>/fd` 锚定 Git 调用与文件写入，文件保存以 RENAME_EXCHANGE 原子交换并回验被换出的 inode；Windows/macOS 走 paseo 路径模式——以规范路径作锚、操作边界用 stat 设备号/inode 核验身份并在变更后复验授权，Git 从工作树正常发现，保存为 fsync + sha1 CAS + rename 原子替换。选择在运行时按平台读取（`lib/stable.js`），测试可注入模拟平台。
+_Avoid_: 跨平台降级（那是能力分层，不是功能删减）、Windows 特例
 
 **创建事务日志（create journal）**：
 仓库专属受管根先以 fsync owner record 绑定 main repo dev/inode；`git worktree add` 前再写入 fsync pending，包含 txId、路径、分支和不可变创建 OID。prepared 阶段不声称拥有未来分支；仅在 Git row/branch/HEAD 与 path/gitdir inode 全部证明后升级 added。元数据提交成功后清除；进程若在中间退出，自动恢复绝不删除仍存在的 path 或 row（普通 status 看不见 ignored/事后文件），只在两者都已由人工移除后按 OID CAS 删除本次拥有的分支；证据不足宁可保留，也会清扫插件专属 PR 临时 ref。owner record 缺失只说明这是一个**遗留受管根**（早于该记录诞生的根），解析事务前必须先经 `prepareManagedRoot` 认领；只有记录存在但 dev/inode 不符才是「仓库被替换」，必须拒绝。
@@ -164,7 +168,7 @@ _Avoid_: 附件、提及
 _Avoid_: diff tab（那是已删除的会话视图）
 
 **文件编辑器**：
-diff 视图内的文本编辑面板：等宽 textarea、脏标记、Ctrl/Cmd+S；保存走 POST /file 的 sha1 条件写入。同一宿主实例内按规范文件路径串行提交，并以原子交换后的旧 inode 再验预期内容；冲突返回 409，临时文件仅在 inode 仍属本事务时删除。非协作的外部写者不共享这把锁，因此协议承诺以宿主 API 写入的线性化与冲突检测为边界。会话「文件」视图随官方右侧栏「文件」面板下线后，本编辑器只服务 diff 视图。
+diff 视图内的文本编辑面板：等宽 textarea、脏标记、Ctrl/Cmd+S；保存走 POST /file 的 sha1 条件写入。同一宿主实例内按规范文件路径串行提交；Linux 以原子交换后的旧 inode 再验预期内容并支持换回回滚，其余平台按平台锚定用 CAS 复查加 rename 原子替换；冲突返回 409，临时文件仅在 inode 仍属本事务时删除。非协作的外部写者不共享这把锁，因此协议承诺以宿主 API 写入的线性化与冲突检测为边界。会话「文件」视图随官方右侧栏「文件」面板下线后，本编辑器只服务 diff 视图。
 _Avoid_: 在线 IDE
 
 **任务 diff（task diff）**：
