@@ -163,6 +163,139 @@ assert.equal(requestSignal?.aborted, true, 'unmount aborts the picker request ow
 assert.equal(document.activeElement, prior, 'unmount restores the previously focused element');
 container.remove();
 
+/* ---------------- sidebar badge row vs the late-mounted time cell ---------------- */
+/* A blank session row renders only slot+title: DSH gates `.time`, the pin marker
+   and `.rowActions` on `!row.blank`, so they mount only after the first message.
+   React appends those freshly mounted cells at the row's actual end — behind the
+   badge container the injector appended earlier — which made the 100%-wide badge
+   row own the first line and pushed the timestamp onto the next line at the
+   content start. The fix is two-part: the badge rule carries `order: 1` so the
+   visual line cannot depend on DOM order, and pass() moves the injected node
+   back so the DOM order agrees too. This drives the real apply() wiring. */
+const rowHost = document.createElement('div');
+document.body.appendChild(rowHost);
+function BlankableRow({ node, blank }) {
+  return React.createElement('div', { className: 'Rows_sessionRow__t bw-blank-row', 'data-session': node.id },
+    React.createElement('span', { className: 'Rows_slot__t' }),
+    React.createElement('span', { className: 'Rows_title__t' }, 'scratch'),
+    blank ? null : React.createElement('span', { className: 'Rows_time__t' }, '1h'),
+    blank ? null : React.createElement('span', { className: 'Rows_pinIndicator__t' }),
+    blank ? null : React.createElement('span', { className: 'Rows_rowActions__t' }),
+  );
+}
+function AnchorlessRow() {
+  return React.createElement('div', { className: 'Rows_sessionRow__t bw-anchorless-row' },
+    React.createElement('span', { className: 'Rows_slot__t' }),
+  );
+}
+
+const appliedEffects = [];
+const sidebarSessions = {
+  byId: { 'bw-regression-sess': { title: 'scratch' } },
+  ids: ['bw-regression-sess'], current: 'bw-regression-sess', phase: 'ready',
+};
+const rowSidebarRightTabs = { register: () => () => {} };
+const mockCtx = {
+  sidebarRightTabs: rowSidebarRightTabs,
+  effect(fn, label) {
+    const dispose = fn(mockCtx);
+    appliedEffects.push({ label, dispose });
+    return dispose;
+  },
+  get(name) {
+    if (name === 'sidebarRightTabs') return rowSidebarRightTabs;
+    if (name === 'sidebarRight') return { openTab() {} };
+    return undefined;
+  },
+  inject(deps, callback) {
+    if (deps.includes('inputTriggers')) callback({ ...mockCtx, inputTriggers: { registerSource: () => () => {} } });
+    else callback(mockCtx);
+    return { dispose() {} };
+  },
+  locale: { register: () => () => {}, bind: () => (key) => key },
+  slots: { inject(_name, registerFn) { registerFn(); return () => {}; }, register: () => () => {} },
+  sessions: { list: { getSnapshot: () => sidebarSessions, subscribe: () => () => {} } },
+  workspaces: { items: [], list: { subscribe: () => () => {} } },
+};
+
+const previousFetch = window.fetch;
+window.fetch = async () => { throw new Error('offline: the row scenario has no host'); };
+globalThis.fetch = window.fetch;
+const rowRoot = createRoot(rowHost);
+await act(async () => {
+  rowRoot.render(React.createElement(React.Fragment, null,
+    React.createElement(BlankableRow, { node: { id: 'bw-regression-sess' }, blank: true }),
+    React.createElement(AnchorlessRow),
+  ));
+});
+await act(async () => { mod.apply(mockCtx); });
+
+const blankRow = rowHost.querySelector('.bw-blank-row');
+const anchorlessRow = rowHost.querySelector('.bw-anchorless-row');
+assert.ok(blankRow && anchorlessRow, 'both session rows rendered');
+const badges = blankRow.querySelector('.dsh-bw-badges');
+assert.ok(badges, 'the injector appended a badge row to the session row');
+/* DOM nodes are compared through cheap strings: assert.equal on two jsdom
+   elements deep-inspects both on failure, which is what makes a failing run
+   explode instead of reporting. */
+const lastChildClass = (row) => (row.lastElementChild ? row.lastElementChild.className : null);
+assert.equal(lastChildClass(blankRow), 'dsh-bw-badges', 'a blank row ends with the badge row');
+assert.ok(!anchorlessRow.querySelector('.dsh-bw-badges'),
+  'a row without the title anchor degrades without injecting');
+
+/* First message: DSH mounts the trailing cells, React appends them behind the
+   injected node — reproduce that exact DOM before asserting the fix. */
+await act(async () => {
+  rowRoot.render(React.createElement(React.Fragment, null,
+    React.createElement(BlankableRow, { node: { id: 'bw-regression-sess' }, blank: false }),
+    React.createElement(AnchorlessRow),
+  ));
+});
+const timeCell = blankRow.querySelector('.Rows_time__t');
+const pinCell = blankRow.querySelector('.Rows_pinIndicator__t');
+const actionCell = blankRow.querySelector('.Rows_rowActions__t');
+assert.ok(timeCell && pinCell && actionCell, 'the first message mounts the trailing cells');
+assert.notEqual(lastChildClass(blankRow), 'dsh-bw-badges',
+  'reproduced: React mounted the trailing cells behind the injected badge row');
+assert.ok((badges.compareDocumentPosition(timeCell) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+  'reproduced: the time cell follows the badge row in DOM order');
+
+/* pass() runs on a 300 ms debounce behind the MutationObserver; poll so the
+   assertion is about the self-heal, not about timing. */
+const healDeadline = Date.now() + 2000;
+while (lastChildClass(blankRow) !== 'dsh-bw-badges' && Date.now() < healDeadline) {
+  await new Promise((resolve) => { setTimeout(resolve, 25); });
+}
+assert.equal(lastChildClass(blankRow), 'dsh-bw-badges',
+  'pass() moved the badge row behind the late-mounted trailing cells');
+for (const cell of [timeCell, pinCell, actionCell]) {
+  assert.ok((cell.compareDocumentPosition(badges) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+    'every native cell precedes the badge row once healed');
+}
+
+const pluginStyle = document.querySelector('style[data-plugin-css="dsh-better-workspaces/client.css"]');
+assert.ok(pluginStyle, 'the plugin stylesheet is mounted');
+const badgesRule = /\.dsh-bw-badges\s*\{([^{}]*)\}/.exec(pluginStyle.textContent);
+assert.ok(badgesRule, 'the badge row rule is present');
+assert.ok(/(^|[;\s])order:\s*1\b/.test(badgesRule[1]),
+  'the badge row carries order:1 so its line cannot depend on DOM order');
+
+const domEffect = appliedEffects.find((entry) => entry.label === 'better-workspaces: dom injection');
+assert.ok(domEffect, 'the DOM injection effect is registered');
+await act(async () => { domEffect.dispose(); });
+assert.equal(document.querySelectorAll('.dsh-bw-badges').length, 0,
+  'dispose removes every injected badge row (ADR 0001)');
+for (const entry of [...appliedEffects].reverse()) {
+  if (entry === domEffect) continue;
+  if (entry.dispose) entry.dispose();
+}
+assert.equal(document.querySelectorAll('style[data-plugin-css="dsh-better-workspaces/client.css"]').length, 1,
+  'releasing the applied package keeps the surviving stylesheet reference');
+await act(async () => { rowRoot.unmount(); });
+rowHost.remove();
+window.fetch = previousFetch;
+globalThis.fetch = window.fetch;
+
 releaseSecondCss();
 assert.equal(document.querySelectorAll('style[data-plugin-css="dsh-better-workspaces/client.css"]').length, 0,
   'the final package cleanup removes the shared style');
