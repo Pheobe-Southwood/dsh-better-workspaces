@@ -251,17 +251,49 @@ The **rendered UI must be looked at**, because DOM-injection degradation is
 silent by design (ADR 0001). The offline suites build their own DOM and
 therefore cannot see the slot framework's wrappers — a slot's `parentElement` is
 the renderer's `display: contents` anchor, *not* the layout row containing it
-(ADR 0001 Amendment 2). Open a blank session in a git workspace and confirm, in
-the console, that both hold:
+(ADR 0001 Amendment 2).
+
+Ask the plugin itself instead of inferring from the DOM, using the read-only
+diagnostic surface it installs while mounted:
 
 ```js
-document.querySelectorAll('[class*="_heroWorkspaceRow"] .dsh-bw-hero').length   // 1
-// and no "hero row anchor changed — worktree control degraded" at Verbose level
+window.__dshBwDebug.describeOnScreen()
+// { currentId, sessionCwd, resolvedCwd, source, owningWorkspacePath,
+//   lastGuard: { visible, noCwd, noDetect, notGit, linkedWorktree },
+//   lastDetect, rowFound, controlCount }
 ```
 
-A `1` here with a missing control means the anchor moved; a `0` means the
-control is not being injected at all. Either way the fix is an anchor selector,
-never a UI rewrite.
+`source` names the tier that supplied the directory — `'session'` for the
+session's own cwd, `'workspace'` for the path of the Workspace that owns it,
+which is what a blank session has before its first message — and `lastGuard`
+names exactly which term of the visibility test decided the outcome. Pair it
+with `probe()`, which reports the DOM the injector actually saw:
+
+```js
+window.__dshBwDebug.probe()
+// dom: { rowCount, rowFound, rowChildren:[{cls,dataSlot,display,text}], slotTags, controls:[...] }
+// resolution: the fields describeOnScreen reports
+```
+
+Which reading means what:
+
+| `rowFound` | `controls[0]` | `resolvedCwd` | `lastGuard` | layer to fix |
+|---|---|---|---|---|
+| `false` | none | any | — | the hero row is not on screen; not a defect |
+| `true` | none | `null` | `noCwd` | resolution: neither the session nor its Workspace gives a directory |
+| `true` | none | set | `noDetect` | detection never settled for that cwd |
+| `true` | none | set | `notGit` / `linkedWorktree` | not an ordinary checkout; hiding is by design |
+| `true` | present, `width: 0` | set | `visible` | the control mounted but draws nothing |
+| `true` | absent, `visible` | set | `visible` | injection: the anchor moved |
+
+The rule that keeps this from becoming a rewrite: **no visible control while
+`lastGuard.visible === true` is an anchor bug; every other combination is decided
+before rendering.** This hook is a diagnostic, not a public API — it is
+read-only, removed with the plugin's effect, and carries no stability promise.
+
+If `window.__dshBwDebug` is missing, the browser is still running an older
+bundle: hard-refresh (Ctrl+Shift+R) before reading anything else, because the
+client bundle is assembled once when `dsh web` starts.
 
 ### Upgrading from a pre-bundle install (0.0.1)
 

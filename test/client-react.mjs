@@ -141,6 +141,41 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
   assert.notEqual(heroControlKey('s1', '/a'), heroControlKey('s1', '/b'),
     'the control key moves when the resolved cwd moves');
   assert.equal(heroControlKey('s1', '/a'), heroControlKey('s1', '/a'), 'the key is stable otherwise');
+
+  // The source is what makes a report legible: "hidden although the session
+  // carries this cwd" and "hidden because nothing resolved" are different bugs.
+  const { heroResolve } = mod.__bwTest;
+  const resolveCases = [
+    [{ cwd: '/repo-bound' }, 's1', { cwd: '/repo-bound', source: 'session' }, 'a session cwd reports itself as the source'],
+    [{}, 's1', { cwd: '/repo-w1', source: 'workspace' }, 'a workspace-derived cwd reports the workspace as the source'],
+    [{}, 's9', { cwd: null, source: null }, 'an unresolved cwd names no source'],
+    [{ cwd: '/elsewhere' }, 's1', { cwd: '/elsewhere', source: 'session' }, 'a bound session cwd outranks workspace membership'],
+  ];
+  for (const [summary, id, expected, label] of resolveCases) {
+    const actual = heroResolve(summary, id, items);
+    assert.equal(actual.cwd, expected.cwd, `${label} (cwd)`);
+    assert.equal(actual.source, expected.source, `${label} (source)`);
+  }
+
+  // projection must be total and must not leak the stores' own objects
+  const { projectSessionSnapshot, projectWorkspaceSnapshot } = mod.__bwTest;
+  assert.equal(projectSessionSnapshot(null), null, 'a missing session snapshot projects to null');
+  assert.equal(projectSessionSnapshot(undefined), null, 'an undefined session snapshot projects to null');
+  const projected = projectSessionSnapshot({ current: 's1', ids: ['s1'], phase: 'ready', byId: { s1: { title: 'T' } } });
+  assert.equal(projected.current, 's1');
+  assert.equal(projected.ids.length, 1, 'ids project through');
+  assert.equal(projected.ids[0], 's1');
+  assert.equal(projected.phase, 'ready');
+  assert.equal(projected.byId.s1.cwd, null,
+    'a session without cwd projects an explicit null rather than dropping the field');
+  assert.equal(projected.byId.s1.title, 'T');
+  assert.equal(projectWorkspaceSnapshot(null), null, 'a missing Workspace snapshot projects to null');
+  const oddWorkspace = projectWorkspaceSnapshot({ items: [{ workspaceId: 'w' }] }).items[0];
+  assert.equal(oddWorkspace.workspaceId, 'w');
+  assert.equal(oddWorkspace.sessionIds.length, 0,
+    'malformed Workspace rows project safely instead of throwing');
+  assert.equal(projectWorkspaceSnapshot({ items: [{ workspaceId: 'w', sessionIds: ['a'] }] }).items[0].sessionIds[0], 'a',
+    'Workspace session membership projects through');
 }
 
 /* The real component, in the state that matters: a blank Session whose cwd
@@ -342,6 +377,26 @@ await act(async () => {
 });
 await act(async () => { mod.apply(mockCtx); });
 
+/* The diagnostic surface must exist while the plugin is mounted: it is the
+   only way to separate "never injected" from "injected but hidden" in a bug
+   report, so its presence and shape are part of the contract. */
+{
+  const hook = window.__dshBwDebug;
+  assert.ok(hook, 'apply installs window.__dshBwDebug');
+  for (const name of ['sessions', 'workspaces', 'hero', 'probe', 'describeOnScreen']) {
+    assert.equal(typeof hook[name], 'function', `__dshBwDebug.${name} is callable`);
+  }
+  // every reader must be total: a diagnostic that throws is worse than none
+  assert.doesNotThrow(() => hook.sessions(), 'sessions() is safe before any session is seen');
+  assert.doesNotThrow(() => hook.workspaces(), 'workspaces() is safe before any Workspace is seen');
+  assert.doesNotThrow(() => hook.hero(), 'hero() is safe');
+  assert.doesNotThrow(() => hook.probe(), 'probe() is safe');
+  const onScreen = hook.describeOnScreen();
+  assert.equal(typeof onScreen.rowFound, 'boolean', 'describeOnScreen reports the DOM verdict');
+  assert.ok(Object.hasOwn(onScreen, 'source'), 'the resolution source is reported');
+  assert.ok(Object.hasOwn(onScreen, 'resolvedCwd'), 'the resolved cwd is reported');
+}
+
 const blankRow = rowHost.querySelector('.bw-blank-row');
 const anchorlessRow = rowHost.querySelector('.bw-anchorless-row');
 assert.ok(blankRow && anchorlessRow, 'both session rows rendered');
@@ -453,6 +508,8 @@ for (const entry of [...appliedEffects].reverse()) {
   if (entry === domEffect) continue;
   if (entry.dispose) entry.dispose();
 }
+assert.equal(window.__dshBwDebug, undefined,
+  'disposing every effect removes the diagnostic global (no residue on window)');
 assert.equal(document.querySelectorAll('style[data-plugin-css="dsh-better-workspaces/client.css"]').length, 1,
   'releasing the applied package keeps the surviving stylesheet reference');
 await act(async () => { rowRoot.unmount(); });
