@@ -61,8 +61,8 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    commits exist, and the bare `diff` otherwise — because the conversation no
    longer carries a diff tab of its own. In the sidebar the file list sits
    above the diff pane so the 300 px panel stays readable.
-   The old `文件`/`diff` conversation tabs are gone: dsh 0.1.5 shipped the
-   right Sidebar's own `文件` panel, which supersedes the plugin's file view.
+   The old `文件`/`diff` conversation tabs are gone: the official right
+   Sidebar ships its own `文件` panel, which supersedes the plugin's file view.
 4. **Diff view** — four modes with paseo-parity defaults: `未提交` (working
    tree incl. untracked vs HEAD), `本会话` (default in shared workspaces: the
    uncommitted diff filtered to files this session wrote, attributed from its
@@ -139,7 +139,7 @@ See `CONTEXT.md` for the glossary and `docs/adr/` for the design records.
 
 ## Install (web profile)
 
-Prerequisites: `dsh` ≥ 0.1.5 with the `web` profile, Node.js ≥ 20.19,
+Prerequisites: `dsh` ≥ 0.2.0 with the `web` profile, Node.js ≥ 20.19,
 `pnpm` on `PATH`, `git` ≥ 2.31, and a supported platform — Linux, Windows
 10+/Server 2016+ (Git for Windows), or macOS 13+. Platform anchoring is
 layered (ADR 0013): **Linux** pins every repository mutation and file save
@@ -158,7 +158,7 @@ absent.
 **One command installs and mounts the plugin** (plain JS, no build step):
 
 ```bash
-dsh plugin --profile web add github:Pheobe-Southwood/dsh-better-workspaces
+dsh plugin --profile web add github:cup113/dsh-better-workspaces
 ```
 
 Then restart `dsh --profile web` once. There is no second step: this package is
@@ -187,6 +187,50 @@ Uninstall is symmetric — reconcile also drops the bundle from
 ```bash
 dsh plugin --profile web remove dsh-better-workspaces
 ```
+
+### Verifying a release against a live dsh (required before publishing)
+
+The offline suites (`npm test`) load this package's own JS with stub `ctx`,
+stub slot hooks and a stub right-Sidebar registry. That is deliberate — it keeps
+them fast and hermetic — but it means **they cannot see the harness's live
+contracts**, so they pass while a contract drifts. Real examples caught only by
+the recipe below: the right-Sidebar registry requires a `guide[].id` this
+package originally omitted, and the host's workspace-registry `create()` moved
+from sync to `async` while `sessions.list()` changed from an id map to `Session[]`.
+
+A throwaway profile proves both halves against the `dsh` on `PATH` without
+touching your real profile. It is cheap and catches the whole class:
+
+```bash
+snap=$(mktemp -d)/bw          # a snapshot OUTSIDE this repo
+git worktree add --detach "$snap" HEAD
+scratch=$(mktemp -d)/dshhome
+mkdir -p "$scratch/profiles/web"
+printf 'name: dsh-profile-web\nphase: external\nisolation: manual\n' \
+  > "$scratch/profiles/web/cordis.yml"
+printf '{"name":"dsh-profile-web","private":true,"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"],"patchReload":"live"}},"dependencies":{}}' \
+  > "$scratch/profiles/web/package.json"
+printf 'packages:\n  - .\n' > "$scratch/profiles/web/pnpm-workspace.yaml"
+
+# 1. the CLI reconciles the bundle and the loader composes exactly one row
+DSH_HOME="$scratch" dsh plugin --profile web add "link:$snap"
+DSH_HOME="$scratch" dsh --profile web --dump-config | grep -A 1 '== dsh-better-workspaces'
+
+# 2. boot it and prove BOTH halves are live (host route + browser bundle)
+DSH_HOME="$scratch" dsh --profile web --no-open --port 3099 &
+curl -s http://127.0.0.1:3099/better-workspaces/api/worktree-workspaces
+#   expected {"ok":true,...}; 404 means the row did not activate
+# open the printed ?token= URL, then confirm the plugin bundle is injected and
+# served (both must be 200 — 200 + 404 means the host half mounted while the
+# browser half did not build):
+#   grep -o 'better-workspaces/client.js' <index.html>
+#   curl -b <cookie> 'http://127.0.0.1:3099/plugins/??...,dsh-better-workspaces/client.js,...'
+```
+
+`link:` points at the snapshot, so the plugin is installed from a clean
+checkout — what a user gets from `github:cup113/dsh-better-workspaces` — and
+your working tree stays untouched. Then remove the probe worktree
+(`git worktree remove "$snap"`).
 
 ### Upgrading from a pre-bundle install (0.0.1)
 

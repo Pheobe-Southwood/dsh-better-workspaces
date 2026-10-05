@@ -1,7 +1,7 @@
 {
   "name": "dsh-better-workspaces",
   "description": "Git workspace enhancements for the DeepSeek Harness Web GUI: worktree staging in the hero row, per-session git badges in the sidebar, a diff page in the official right sidebar, paseo-style pull/push/PR actions",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -14,12 +14,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Pheobe-Southwood/dsh-better-workspaces.git"
+    "url": "git+https://github.com/cup113/dsh-better-workspaces.git"
   },
   "bugs": {
-    "url": "https://github.com/Pheobe-Southwood/dsh-better-workspaces/issues"
+    "url": "https://github.com/cup113/dsh-better-workspaces/issues"
   },
-  "homepage": "https://github.com/Pheobe-Southwood/dsh-better-workspaces#readme",
+  "homepage": "https://github.com/cup113/dsh-better-workspaces#readme",
   "keywords": [
     "deepseek-harness",
     "dsh",
