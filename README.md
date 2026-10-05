@@ -232,6 +232,33 @@ checkout — what a user gets from `github:cup113/dsh-better-workspaces` — and
 your working tree stays untouched. Then remove the probe worktree
 (`git worktree remove "$snap"`).
 
+**Two footguns in that recipe, both learned the hard way.**
+
+`link:` is for probing only. The profile's correctness then depends on a
+directory that lives outside it, so **the moment the snapshot is deleted the
+plugin's manifest becomes unreadable** and the Plugins page renders
+`包元信息错误: Plugin metadata for dsh-better-workspaces: … ENOENT: no such file
+or directory, open '/…/package.json'` — the plugin itself keeps running, only
+its display metadata breaks. Always replace the probe with the published spec
+(same command without the `link:`) before walking away, and only then remove the
+snapshot.
+
+The **rendered UI must be looked at**, because DOM-injection degradation is
+silent by design (ADR 0001). The offline suites build their own DOM and
+therefore cannot see the slot framework's wrappers — a slot's `parentElement` is
+the renderer's `display: contents` anchor, *not* the layout row containing it
+(ADR 0001 Amendment 2). Open a blank session in a git workspace and confirm, in
+the console, that both hold:
+
+```js
+document.querySelectorAll('[class*="_heroWorkspaceRow"] .dsh-bw-hero').length   // 1
+// and no "hero row anchor changed — worktree control degraded" at Verbose level
+```
+
+A `1` here with a missing control means the anchor moved; a `0` means the
+control is not being injected at all. Either way the fix is an anchor selector,
+never a UI rewrite.
+
 ### Upgrading from a pre-bundle install (0.0.1)
 
 Versions before 0.1.0 declared only `dsh.client`, so mounting meant

@@ -273,6 +273,58 @@ for (const cell of [timeCell, pinCell, actionCell]) {
     'every native cell precedes the badge row once healed');
 }
 
+/* ------------------------------------------------------------------ *
+ * hero injection anchors (ADR 0001 Amendment 1)
+ *
+ * Every slot is wrapped by the slot framework in an anchor div carrying
+ * `data-slot` and `style="display: contents"`, so that wrapper — not the
+ * layout row — is the slot's parentElement. Reading the row off
+ * `parentElement` silently degraded the worktree control while every guard
+ * still looked satisfied. This case renders the REAL production nesting
+ * inside the live `apply` window.
+ * ------------------------------------------------------------------ */
+{
+  const { isHeroRow, nearestLayoutAncestor } = mod.__bwTest;
+  const row = document.createElement('div');
+  row.className = 'wSkVaW_heroWorkspaceRow';
+  const chip = document.createElement('button');
+  chip.className = 'wSkVaW_chip';
+  row.appendChild(chip);
+  const outlet = document.createElement('div');
+  outlet.setAttribute('data-slot', 'conversation.hero.agentPreset');
+  outlet.style.display = 'contents';
+  row.appendChild(outlet);
+  document.body.appendChild(row);
+
+  assert.equal(isHeroRow(nearestLayoutAncestor(outlet)), true,
+    'climbing from the preset slot past the display:contents outlet reaches the hero row');
+
+  // pass() runs on a 300 ms debounce behind the MutationObserver; poll so the
+  // assertion is about the anchor logic, not about timing.
+  await act(async () => {
+    const heroDeadline = Date.now() + 2000;
+    while (!row.querySelector(':scope > .dsh-bw-hero') && Date.now() < heroDeadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 25); });
+    }
+  });
+  const injected = row.querySelector(':scope > .dsh-bw-hero');
+  assert.ok(injected, 'the worktree control is injected into the hero row despite the slot outlet wrapper');
+  assert.equal(row.querySelectorAll('.dsh-bw-hero').length, 1, 'exactly one control instance');
+  assert.equal(injected.parentElement, row,
+    'the control is a direct child of the layout row, not of the display:contents wrapper');
+
+  const before = injected;
+  await act(async () => {
+    const settleDeadline = Date.now() + 1200;
+    while (Date.now() < settleDeadline) await new Promise((resolve) => { setTimeout(resolve, 50); });
+  });
+  assert.equal(row.querySelector('.dsh-bw-hero'), before,
+    'later passes reuse the same control element instead of remounting it');
+
+  row.remove();
+  assert.equal(document.querySelectorAll('.dsh-bw-hero').length, 0, 'removing the row drops the control');
+}
+
 const pluginStyle = document.querySelector('style[data-plugin-css="dsh-better-workspaces/client.css"]');
 assert.ok(pluginStyle, 'the plugin stylesheet is mounted');
 const badgesRule = /\.dsh-bw-badges\s*\{([^{}]*)\}/.exec(pluginStyle.textContent);
@@ -299,6 +351,53 @@ globalThis.fetch = window.fetch;
 releaseSecondCss();
 assert.equal(document.querySelectorAll('style[data-plugin-css="dsh-better-workspaces/client.css"]').length, 0,
   'the final package cleanup removes the shared style');
+
+/* ------------------------------------------------------------------ *
+ * hero anchor helpers, off the live window (no app runtime needed —
+ * these exercise the climb and the degrade path, not HeroControl).
+ * ------------------------------------------------------------------ */
+const { createHeroInjector, nearestLayoutAncestor: climb, isHeroRow: heroRowish } = mod.__bwTest;
+
+// a display:contents outlet is skipped; the layout row behind it is returned
+{
+  const row = document.createElement('div');
+  row.className = 'wSkVaW_heroWorkspaceRow';
+  const outlet = document.createElement('div');
+  outlet.style.display = 'contents';
+  row.appendChild(outlet);
+  document.body.appendChild(row);
+  assert.equal(climb(outlet), row, 'the climb skips a display:contents wrapper');
+  assert.equal(heroRowish(climb(outlet)), true, 'the climb lands on the hero row');
+
+  // a wrapper that renders nothing owns no box either
+  const empty = document.createElement('div');
+  outlet.appendChild(empty);
+  assert.equal(climb(empty), row, 'an empty emission wrapper is skipped too');
+
+  // the depth cap stops a pathological tree instead of walking to document.body
+  let deep = outlet;
+  for (let i = 0; i < 12; i += 1) {
+    const wrap = document.createElement('div');
+    wrap.style.display = 'contents';
+    deep.appendChild(wrap);
+    deep = wrap;
+  }
+  assert.equal(climb(deep), null, 'the climb gives up past the depth cap rather than returning a wrong node');
+  row.remove();
+}
+
+// negative: a hero row that is structurally unrecognizable must not receive a control
+{
+  const stray = document.createElement('div');
+  stray.setAttribute('data-slot', 'conversation.hero.agentPreset');
+  document.body.appendChild(stray);
+  const injector = createHeroInjector();
+  assert.doesNotThrow(() => injector.start(), 'a missing hero row degrades silently');
+  await act(async () => { await new Promise((r) => setTimeout(r, 400)); });
+  assert.equal(document.querySelectorAll('.dsh-bw-hero').length, 0, 'nothing is injected without a hero row');
+  await act(async () => { injector.dispose(); });
+  stray.remove();
+}
 
 dom.window.close();
 console.log('CLIENT REACT: ALL PASS');
