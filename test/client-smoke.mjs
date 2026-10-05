@@ -63,6 +63,11 @@ const sidebarRightTabs = {
   },
 };
 const sidebarRight = { openTab() {} };
+/* Revealing a Session is the workspace UI's job — the `sessions` face has no
+   `open`, and calling it threw "sessions.open is not a function" after a
+   worktree had already been created. Every reveal is recorded here. */
+const revealedSessions = [];
+const uiWorkspace = { openSession(sessionId) { revealedSessions.push(sessionId); } };
 /* The trigger pipeline: the forge reference codec registers here. */
 const triggerSources = [];
 const inputTriggers = {
@@ -90,6 +95,7 @@ const ctx = {
   get(name) {
     if (name === 'sidebarRightTabs') return sidebarRightTabs;
     if (name === 'sidebarRight') return sidebarRight;
+    if (name === 'uiWorkspace') return uiWorkspace;
     return undefined;
   },
   inject(deps, callback) {
@@ -931,7 +937,10 @@ function draftSessions(source, target, open = () => {}) {
   const conversation = { input: { for: (scope) => byId[scope.id] } };
   return {
     scope: (id) => ({ id, get: (name) => name === 'conversation' ? conversation : undefined }),
-    open,
+    // NOT `sessions.open`: that method does not exist on the real controller
+    // face, and calling it threw "sessions.open is not a function" after a
+    // worktree had already been created. Revealing goes through the workspace UI.
+    reveal: open,
   };
 }
 const sourceDraft = draftInput('carry me');
@@ -945,11 +954,11 @@ assert.equal(T.sessionsHaveEmptyDrafts(sessionsForDraft, ['source', 'target']), 
 assert.equal(T.transferSessionDraft(sessionsForDraft, 'source', 'target', capturedDraft), true);
 assert.equal(sourceDraft.state.getSnapshot().draft, '');
 assert.equal(targetDraft.state.getSnapshot().draft, 'carry me');
-assert.deepEqual(opened, ['target'], 'target opens only after verified draft transfer');
+assert.deepEqual(revealedSessions, ['target'], 'target is revealed through uiWorkspace only after a verified draft transfer');
 
 const changedSource = draftInput('old');
 const changedTarget = draftInput('');
-const changedSessions = draftSessions(changedSource, changedTarget, () => { throw new Error('must not open'); });
+const changedSessions = draftSessions(changedSource, changedTarget, () => { throw new Error('must not reveal'); });
 const staleDraft = T.readSessionDraft(changedSessions, 'source');
 changedSource.setDraft('new');
 assert.equal(T.transferSessionDraft(changedSessions, 'source', 'target', staleDraft), false);
@@ -957,7 +966,7 @@ assert.equal(changedSource.state.getSnapshot().draft, 'new', 'draftRev CAS prese
 assert.equal(changedTarget.state.getSnapshot().draft, '');
 const claimedSource = draftInput('claim');
 const claimedTarget = draftInput('');
-const claimedSessions = draftSessions(claimedSource, claimedTarget, () => { throw new Error('must not open'); });
+const claimedSessions = draftSessions(claimedSource, claimedTarget, () => { throw new Error('must not reveal'); });
 const claimedCapture = T.readSessionDraft(claimedSessions, 'source');
 claimedSource.setPhase('claimed');
 assert.equal(T.transferSessionDraft(claimedSessions, 'source', 'target', claimedCapture), false,
@@ -970,7 +979,7 @@ let liveSourceInput = detachedSource;
 const detachedConversation = { input: { for: (scope) => scope.id === 'source' ? liveSourceInput : detachedTarget } };
 const detachedSessions = {
   scope: (id) => ({ id, get: (name) => name === 'conversation' ? detachedConversation : undefined }),
-  open: () => { throw new Error('must not open'); },
+  open: () => { throw new Error('must not reveal'); },
 };
 const detachedCapture = T.readSessionDraft(detachedSessions, 'source');
 liveSourceInput = replacementSource;
@@ -985,7 +994,7 @@ reentrantTarget.setDraft = (text) => {
   originalTargetSetDraft(text);
   if (text === 'captured') reentrantSource.setDraft('newer during target write');
 };
-const reentrantSessions = draftSessions(reentrantSource, reentrantTarget, () => { throw new Error('must not open'); });
+const reentrantSessions = draftSessions(reentrantSource, reentrantTarget, () => { throw new Error('must not reveal'); });
 assert.equal(T.transferSessionDraft(reentrantSessions, 'source', 'target', T.readSessionDraft(reentrantSessions, 'source')), false);
 assert.equal(reentrantSource.state.getSnapshot().draft, 'newer during target write',
   'second CAS failure never rolls the source back over a newer draft');
@@ -993,17 +1002,22 @@ assert.equal(reentrantTarget.state.getSnapshot().draft, '');
 
 const guardedSource = draftInput('valuable');
 const noopTarget = draftInput('', true);
-const guardedSessions = draftSessions(guardedSource, noopTarget, () => { throw new Error('must not open'); });
+const guardedSessions = draftSessions(guardedSource, noopTarget, () => { throw new Error('must not reveal'); });
 assert.equal(T.transferSessionDraft(guardedSessions, 'source', 'target', T.readSessionDraft(guardedSessions, 'source')), false);
 assert.equal(guardedSource.state.getSnapshot().draft, 'valuable', 'unconfirmed target write never clears source');
 
 const rollbackSource = draftInput('restore');
 const rollbackTarget = draftInput('');
-const rollbackSessions = draftSessions(rollbackSource, rollbackTarget, () => { throw new Error('open failed'); });
+const rollbackSessions = draftSessions(rollbackSource, rollbackTarget, () => { /* reveal comes from uiWorkspace below */ });
+// A reveal failure must still surface: the transfer is CAS-verified before it,
+// but a caller that believes the view moved when it did not is worse off.
+const healthyReveal = uiWorkspace.openSession;
+uiWorkspace.openSession = () => { throw new Error('reveal failed'); };
 assert.throws(
   () => T.transferSessionDraft(rollbackSessions, 'source', 'target', T.readSessionDraft(rollbackSessions, 'source')),
-  /open failed/,
+  /reveal failed/,
 );
+uiWorkspace.openSession = healthyReveal;
 assert.equal(rollbackSource.state.getSnapshot().draft, 'restore');
 assert.equal(rollbackTarget.state.getSnapshot().draft, '');
 
@@ -1050,7 +1064,7 @@ assert.deepEqual(reentrantAttachmentTarget.state.getSnapshot().attachmentIds, []
 
 const referenceSource = draftInput('@issue', false, [], [{ source: 'forge', ref: 'issue:1' }]);
 const referenceTarget = draftInput('');
-const referenceSessions = draftSessions(referenceSource, referenceTarget, () => { throw new Error('must not open'); });
+const referenceSessions = draftSessions(referenceSource, referenceTarget, () => { throw new Error('must not reveal'); });
 assert.equal(T.transferSessionDraft(
   referenceSessions,
   'source',

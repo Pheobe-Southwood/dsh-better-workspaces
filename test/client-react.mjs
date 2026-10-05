@@ -203,10 +203,135 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
     'Workspace session membership projects through');
 }
 
+/* ------------------------------------------------------------------ *
+ * the create path, which was UNREACHABLE for as long as
+ * `currentSessionId()` read a `current` field the sessions list never
+ * carried (dsh-api-session-controller publishes ids/byId/phase only)
+ * ------------------------------------------------------------------ */
+{
+  // The predicate that nine create/ownership/archive guards compare against.
+  {
+    const emptyList = { byId: {}, ids: [], phase: 'ready' };
+    const probeSession = stubUiSession('probe-1');
+    const restoreProbe = mod.__bwTest.setTestRuntime({
+      get: (name) => (name === 'uiSession' ? probeSession : undefined),
+      sessions: { list: { getSnapshot: () => emptyList, subscribe: () => () => {} } },
+    });
+    assert.equal(mod.__bwTest.currentSessionId(), 'probe-1', 'the on-screen id comes from uiSession, not the list');
+    probeSession.setKey('probe-2');
+    assert.equal(mod.__bwTest.currentSessionId(), 'probe-2', 'and it follows a navigation');
+    // A keyless binding answers undefined, and the list's (non-existent)
+    // `current` field must not be consulted to fill the gap.
+    const keyless = stubUiSession(undefined);
+    mod.__bwTest.setTestRuntime({
+      get: (name) => (name === 'uiSession' ? keyless : undefined),
+      sessions: { list: { getSnapshot: () => ({ ...emptyList, current: 'stale-id' }), subscribe: () => () => {} } },
+    });
+    assert.equal(mod.__bwTest.currentSessionId(), undefined,
+      'a keyless binding resolves to nothing rather than the legacy list field');
+    restoreProbe();
+  }
+
+  // End to end: clicking create must actually send the request. With the old
+  // predicate it never did — the guard returned before apiPost, so the click
+  // produced no request, no busy state and no error at all.
+  const createSessionId = 'create-1';
+  let postedBody = null;
+  const createStore = {
+    snapshot: { items: [], archivedSessionIds: [], pinnedSessionIds: [], state: 'ready', phase: 'ready', error: null },
+    listeners: new Set(),
+    subscribe(listener) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; },
+    getSnapshot() { return this.snapshot; },
+  };
+  const createUiSession = stubUiSession(createSessionId);
+  // The source Session needs a READABLE COMPOSER: the create path captures the
+  // source draft before it POSTs (the handoff moves that draft into the new
+  // Session), and without one it refuses with "source composer is unavailable".
+  // Same shape the smoke suite uses for draft transfer.
+  let sourceDraftState = { draft: 'carry me', draftRev: 1, phase: 'plain', attachmentIds: [], occurrences: [] };
+  const createInput = {
+    state: { getSnapshot: () => sourceDraftState },
+    setDraft(text) { sourceDraftState = { ...sourceDraftState, draft: text, draftRev: sourceDraftState.draftRev + 1 }; },
+    addAttachments() { return false; },
+    removeAttachment() { return false; },
+  };
+  const createConversation = { input: { for: () => createInput } };
+  const createScope = { get: (name) => (name === 'conversation' ? createConversation : undefined) };
+  // ONE snapshot object, never a rebuild per read: useSyncExternalStore treats a
+  // fresh object as a change and re-renders forever otherwise (the rule this
+  // change's own comment in heroDebugState keeps warning about).
+  const createSessions = { byId: { [createSessionId]: { cwd: '/repo-create', title: 'C' } }, ids: [createSessionId], phase: 'ready' };
+  // Third argument echoes interpolation params: with the default key-returning
+  // stub a `hero.failed` message renders as the bare key and hides its cause.
+  const restoreCreate = mod.__bwTest.setTestRuntime({
+    get: (name) => (name === 'uiSession' ? createUiSession : undefined),
+    sessions: { list: { getSnapshot: () => createSessions, subscribe: () => () => {} }, scope: () => createScope },
+    workspaces: { list: createStore },
+  }, null, (key, params) => (params && params.message ? key + ':' + params.message : key));
+  const previousCreateFetch = window.fetch;
+  const createRequests = [];
+  window.fetch = async (url, options = {}) => {
+    const parsed = new URL(String(url), window.location.href);
+    createRequests.push((options.method || 'GET') + ' ' + parsed.pathname + parsed.search);
+    if (parsed.pathname.endsWith('/detect')) {
+      return { json: async () => ({ ok: true, isGit: true, isLinkedWorktree: false, managed: false }) };
+    }
+    if (parsed.pathname.endsWith('/branches')) {
+      return { json: async () => ({ ok: true, current: 'main', branches: [{ name: 'main', hasLocal: true, hasRemote: false, current: true }] }) };
+    }
+    if (parsed.pathname.endsWith('/pulls')) return { json: async () => ({ ok: true, items: [] }) };
+    if (parsed.pathname.endsWith('/worktrees') && options.method === 'POST') {
+      postedBody = JSON.parse(String(options.body || '{}'));
+      return { json: async () => ({ ok: false, error: 'boom', message: 'boom' }) };
+    }
+    throw new Error(`unexpected create request: ${parsed.pathname}${parsed.search}`);
+  };
+  globalThis.fetch = window.fetch;
+
+  const createContainer = document.createElement('div');
+  document.body.appendChild(createContainer);
+  const createRoot2 = createRoot(createContainer);
+  await act(async () => { createRoot2.render(React.createElement(mod.__bwTest.HeroControl)); });
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  await act(async () => { createContainer.querySelector('.dsh-bw-hero-btn').click(); });
+  // the popover is state: it needs its own commit before its items exist
+  await act(async () => { await Promise.resolve(); });
+  const newItem = [...createContainer.querySelectorAll('.dsh-bw-menu-item')].find((i) => i.textContent.includes('hero.modeWorktree'));
+  assert.ok(newItem, 'the mode menu offers 新建 worktree');
+  await act(async () => { newItem.click(); });
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+  const armedName = createContainer.querySelector('.dsh-bw-hero-input').value;
+  assert.ok(armedName.length > 0, 'the form arms itself with a usable branch name');
+  const submit = createContainer.querySelector('button.dsh-bw-btn-primary');
+  assert.equal(submit.disabled, false, 'create is enabled as soon as the form opens');
+  await act(async () => { submit.click(); });
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+
+  assert.ok(postedBody, 'clicking create POSTs /worktrees — saw: ' + createRequests.join(' | '));
+  assert.equal(postedBody.branchName, armedName, 'the request carries the staged branch name');
+  assert.equal(postedBody.sourceSessionId, createSessionId, 'and the source Session');
+  assert.equal(typeof postedBody.txId, 'string', 'and its idempotency txId');
+  assert.equal(postedBody.intent, 'branch-off', 'a branch-off intent, not a PR checkout');
+  assert.match(createContainer.querySelector('.dsh-bw-hero-error[role="alert"]')?.textContent || '', /boom/,
+    'a rejected creation surfaces the host message inline instead of failing silently');
+
+  await act(async () => { createRoot2.unmount(); });
+  createContainer.remove();
+  window.fetch = previousCreateFetch;
+  globalThis.fetch = window.fetch;
+  restoreCreate();
+}
+
 /* The real component, in the state that matters: a blank Session whose cwd
    comes only from its Workspace membership. */
 {
-  const blankSnapshot = { byId: { s1: { title: 'blank' } }, ids: ['s1'], current: 's1', phase: 'ready' };
+  // The Session is on screen (uiSession carries it) while its own cwd is still
+  // absent — the state this control exists for. Membership is then the only way
+  // it can find a directory. No fabricated `current`: the real list store never
+  // carries that field and the control no longer reads it.
+  const blankSnapshot = { byId: { s1: { title: 'blank' } }, ids: ['s1'], phase: 'ready' };
+  const blankUiSession = stubUiSession('s1');
   const workspaceListeners = new Set();
   // `useSyncExternalStore` requires a stable snapshot identity: a store that
   // builds a fresh object per read would re-render forever, so this stand-in
@@ -217,7 +342,7 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
     for (const listener of workspaceListeners) listener();
   };
   const restoreBlank = mod.__bwTest.setTestRuntime({
-    get: () => undefined,
+    get: (name) => (name === 'uiSession' ? blankUiSession : undefined),
     sessions: { list: { getSnapshot: () => blankSnapshot, subscribe: () => () => {} } },
     workspaces: {
       list: {

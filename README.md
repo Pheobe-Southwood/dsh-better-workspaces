@@ -253,6 +253,15 @@ therefore cannot see the slot framework's wrappers — a slot's `parentElement` 
 the renderer's `display: contents` anchor, *not* the layout row containing it
 (ADR 0001 Amendment 2).
 
+**A control that renders is not a control that works.** The hero worktree button
+appeared, was enabled, armed itself with a branch name, and still did nothing for
+a whole session: the on-screen Session was read from `sessions.list.current`, a
+field `dsh-api-session-controller` never publishes, so the create guard returned
+silently *before* the request, the busy state and the error (ADR 0015). When a
+click produces neither a request nor a message, check `__dshBwDebug.hero()`
+(`lastCwd`, `lastGuard`) and then the network panel — a missing request names the
+bug class.
+
 Ask the plugin itself instead of inferring from the DOM, using the read-only
 diagnostic surface it installs while mounted:
 
