@@ -106,6 +106,118 @@ await act(async () => { heroRoot.unmount(); });
 heroContainer.remove();
 restoreRuntime();
 
+/* ------------------------------------------------------------------ *
+ * hero cwd resolution when the Session has none yet (ADR 0001/0002)
+ *
+ * A blank Session can belong to a Workspace while its own `cwd` is still
+ * undefined, and that is precisely the state the hero control exists for.
+ * Reading the path off the owning Workspace is what the official picker does;
+ * with no fallback the control rendered nothing at all.
+ * ------------------------------------------------------------------ */
+const { heroCwdFor, heroControlKey } = mod.__bwTest;
+{
+  const items = [{ workspaceId: 'w1', path: '/repo-w1', title: 'W1', sessionIds: ['s1', 's2'] }];
+  assert.equal(heroCwdFor({ cwd: '/repo-bound' }, 's1', items), '/repo-bound',
+    'a Session-carried cwd wins over membership');
+  assert.equal(heroCwdFor({}, 's1', items), '/repo-w1',
+    'a Session with no cwd resolves through its owning Workspace');
+  assert.equal(heroCwdFor(undefined, 's1', items), '/repo-w1',
+    'membership is still enough when the summary is missing');
+  assert.equal(heroCwdFor({}, 's9', items), null,
+    'a Session owned by no Workspace resolves to nothing rather than guessing');
+  assert.equal(heroCwdFor({}, undefined, items), null, 'no current Session resolves to nothing');
+  assert.equal(heroCwdFor({}, 's1', null), null, 'an absent Workspace store resolves to nothing');
+  assert.equal(heroCwdFor({ cwd: '' }, 's1', items), '/repo-w1', 'an empty cwd falls through to membership');
+
+  // the Workspace row shapes that must be skipped, not crashed on
+  const odd = [
+    { workspaceId: 'x', path: '', sessionIds: ['s1'] },
+    { workspaceId: 'y', sessionIds: ['s1'] },
+    { workspaceId: 'z', path: '/repo-z' },
+    { workspaceId: 'w', path: '/repo-w', sessionIds: 's1' },
+  ];
+  assert.equal(heroCwdFor({}, 's1', odd), null, 'malformed Workspace rows are skipped');
+
+  assert.notEqual(heroControlKey('s1', '/a'), heroControlKey('s1', '/b'),
+    'the control key moves when the resolved cwd moves');
+  assert.equal(heroControlKey('s1', '/a'), heroControlKey('s1', '/a'), 'the key is stable otherwise');
+}
+
+/* The real component, in the state that matters: a blank Session whose cwd
+   comes only from its Workspace membership. */
+{
+  const blankSnapshot = { byId: { s1: { title: 'blank' } }, ids: ['s1'], current: 's1', phase: 'ready' };
+  const workspaceListeners = new Set();
+  // `useSyncExternalStore` requires a stable snapshot identity: a store that
+  // builds a fresh object per read would re-render forever, so this stand-in
+  // owns one object exactly as the real controller does.
+  let workspaceSnapshot = { items: [], phase: 'ready' };
+  const setWorkspaces = (items) => {
+    workspaceSnapshot = { items, phase: 'ready' };
+    for (const listener of workspaceListeners) listener();
+  };
+  const restoreBlank = mod.__bwTest.setTestRuntime({
+    get: () => undefined,
+    sessions: { list: { getSnapshot: () => blankSnapshot, subscribe: () => () => {} } },
+    workspaces: {
+      list: {
+        getSnapshot: () => workspaceSnapshot,
+        subscribe(listener) { workspaceListeners.add(listener); return () => workspaceListeners.delete(listener); },
+      },
+    },
+  });
+  const previousFetch = window.fetch;
+  window.fetch = async (url) => {
+    const parsed = new URL(String(url), window.location.href);
+    if (parsed.pathname.endsWith('/detect') && parsed.searchParams.get('path') === '/repo-w1') {
+      return { json: async () => ({ ok: true, isGit: true, isLinkedWorktree: false, managed: false }) };
+    }
+    throw new Error(`unexpected blank-hero request: ${parsed.pathname}${parsed.search}`);
+  };
+  globalThis.fetch = window.fetch;
+
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const root = createRoot(container);
+
+  // no membership yet → nothing, and no guess
+  await act(async () => { root.render(React.createElement(mod.__bwTest.HeroControl)); });
+  assert.equal(container.querySelector('.dsh-bw-hero-label'), null,
+    'no Workspace membership and no cwd keeps the control hidden');
+
+  // membership arrives, cwd is still absent from the Session
+  await act(async () => {
+    setWorkspaces([{ workspaceId: 'w1', path: '/repo-w1', title: 'W1', sessionIds: ['s1'] }]);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  assert.equal(container.querySelector('.dsh-bw-hero-label')?.textContent, 'hero.modeLocal',
+    'the control appears for a blank Session once its Workspace is known');
+
+  // a linked worktree Workspace must stay hidden even though it resolves
+  window.fetch = async (url) => {
+    const parsed = new URL(String(url), window.location.href);
+    if (parsed.pathname.endsWith('/detect') && parsed.searchParams.get('path') === '/repo-w2') {
+      return { json: async () => ({ ok: true, isGit: true, isLinkedWorktree: true, managed: true }) };
+    }
+    throw new Error(`unexpected blank-hero request: ${parsed.pathname}${parsed.search}`);
+  };
+  globalThis.fetch = window.fetch;
+  await act(async () => {
+    setWorkspaces([{ workspaceId: 'w2', path: '/repo-w2', title: 'W2', sessionIds: ['s1'] }]);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  assert.equal(container.querySelector('.dsh-bw-hero-label'), null,
+    'a linked-worktree Workspace keeps hiding the control (staging inside one is not offered)');
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+  window.fetch = previousFetch;
+  globalThis.fetch = window.fetch;
+  restoreBlank();
+}
+
 // Mount a real hook-using component. This covers effect setup/cleanup, request
 // cancellation, modal semantics, focus trapping and focus restoration with the
 // same React runtime used by package consumers.

@@ -9,7 +9,11 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    a git repo, a mode dropdown appears in the hero row between the workspace
    chip and the 模式 control; it offers `本地` (the workspace root IS the
    repository checkout — the default) and `新建 worktree`, which reveals the
-   base-branch picker. Picking `本地` again leaves staging with no side effect,
+   base-branch picker. It shows as soon as the session belongs to that git
+   Workspace, **before the first message**: a blank session's own `cwd` is still
+   undefined at that point, so the directory is read off the Workspace that owns
+   the session — the same source the official picker derives its label from.
+   Picking `本地` again leaves staging with no side effect,
    so the picker is never a dead end, and the trigger label always shows the
    active mode. **The picker speaks exact refs (paseo parity)**: the
    `origin/<name>` row comes first because it IS the default base — cutting
