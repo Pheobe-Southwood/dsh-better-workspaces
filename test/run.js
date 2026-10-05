@@ -1439,8 +1439,10 @@ await test('exact Workspace deletion is session-safe, target-only, and retry-ide
   const target = { id: 'delete-target', path: '/managed/target', sessionIds: ['session-target'] };
   const unrelated = { id: 'delete-unrelated', path: '/managed/unrelated', sessionIds: ['session-unrelated'] };
   const rows = [target, unrelated];
+  // DSH 0.2.0 exposes no public archive-set read, so the guard proves only the
+  // preconditions it can and then refuses; `archivedSessionIds` is deliberately
+  // absent from this registry stub to keep the suite honest about that.
   const registry = {
-    archivedSessionIds: [],
     list: () => rows,
     async delete(id) {
       const at = rows.findIndex((row) => row.id === id);
@@ -1450,12 +1452,10 @@ await test('exact Workspace deletion is session-safe, target-only, and retry-ide
     },
   };
   const removeExact = createExactWorkspaceDelete(registry);
-  await assert.rejects(removeExact(target.id, target.path, ['session-target']), /unarchived session/);
-  assert.deepEqual(rows, [target, unrelated]);
-  registry.archivedSessionIds = ['session-target'];
-  await assert.rejects(removeExact(target.id, '/replacement', ['session-target']), /no longer matches/);
   await assert.rejects(removeExact(target.id, target.path, ['session-target']), /raw durable membership/,
-    'an existing historical row is retained because captured membership may be incomplete');
+    'captured membership cannot be proven complete, so the exact row is retained');
+  await assert.rejects(removeExact(target.id, '/replacement', ['session-target']), /no longer matches/);
+  await assert.rejects(removeExact(target.id, target.path, undefined), /without captured durable Session membership/);
   assert.deepEqual(rows, [target, unrelated], 'unrelated Workspace identity and grouping are untouched');
   rows.splice(rows.indexOf(target), 1);
   assert.equal(await removeExact(target.id, target.path, ['session-target']), false,

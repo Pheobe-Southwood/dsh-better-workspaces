@@ -756,9 +756,19 @@ assert.equal(diffType.title('sidebar://bw-diff'), 'diff');
 // Amendment 1)
 assert.equal(Array.isArray(diffType.guide), true, 'exactly one guide entry');
 assert.equal(diffType.guide.length, 1);
+// `id` is required by the right-Sidebar's `SidebarRightGuideEntry`: the
+// registry de-duplicates on it and the guide page keys each rendered cell by
+// `[providerId, id]`.
 assert.deepEqual(
   Object.keys(diffType.guide[0]).sort(),
-  ['description', 'icon', 'order', 'title'],
+  ['description', 'icon', 'id', 'order', 'title'],
+);
+assert.equal(typeof diffType.guide[0].id, 'string', 'guide entry carries a stable identity');
+assert.notEqual(diffType.guide[0].id, '', 'guide entry id is non-empty');
+assert.equal(
+  new Set(diffType.guide.map((entry) => entry.id)).size,
+  diffType.guide.length,
+  'guide entry ids are unique within the provider (the registry throws on a collision)',
 );
 assert.equal(diffType.guide[0].order, 20);
 assert.equal(diffType.guide[0].title(), '代码变更');
