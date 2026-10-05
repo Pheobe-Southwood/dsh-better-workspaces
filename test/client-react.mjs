@@ -53,12 +53,34 @@ assert.equal(styles.length, 1, 'releasing an older package retains CSS for the l
 
 // Keyed Hero resources must abort and ignore the old cwd when the session store
 // switches before detection settles.
+//
+// `uiSession` is the service that actually owns the on-screen Session: the
+// provider behind the injected `sessions` service publishes only
+// { ids, byId, phase, projectionsBySession }, so a fixture that puts `current`
+// on the sessions snapshot tests a shape production never produces. Build the
+// binding source the way dsh-client-ui-session does.
+function stubUiSession(id) {
+  let value = id === undefined ? { key: void 0, hooks: {}, keyedHooks: {}, props: {} } : { key: id, hooks: {}, keyedHooks: {}, props: {} };
+  const listeners = new Set();
+  return {
+    current: {
+      getSnapshot: () => value,
+      subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    },
+    setKey(next) {
+      value = next === undefined ? { key: void 0, hooks: {}, keyedHooks: {}, props: {} } : { key: next, hooks: {}, keyedHooks: {}, props: {} };
+      for (const listener of listeners) listener();
+    },
+  };
+}
+
 let sessionSnapshot = {
-  byId: { a: { cwd: '/repo-a', title: 'A' } }, ids: ['a'], current: 'a', phase: 'ready',
+  byId: { a: { cwd: '/repo-a', title: 'A' } }, ids: ['a'], phase: 'ready',
 };
 const sessionListeners = new Set();
+const mainUiSession = stubUiSession('a');
 const restoreRuntime = mod.__bwTest.setTestRuntime({
-  get: () => undefined,
+  get: (name) => (name === 'uiSession' ? mainUiSession : undefined),
   sessions: {
     list: {
       getSnapshot: () => sessionSnapshot,
@@ -87,9 +109,12 @@ const heroRoot = createRoot(heroContainer);
 await act(async () => { heroRoot.render(React.createElement(mod.__bwTest.HeroControl)); });
 assert.equal(typeof resolveDetectA, 'function', 'session A starts detection');
 sessionSnapshot = {
-  byId: { b: { cwd: '/repo-b', title: 'B' } }, ids: ['b'], current: 'b', phase: 'ready',
+  byId: { b: { cwd: '/repo-b', title: 'B' } }, ids: ['b'], phase: 'ready',
 };
 await act(async () => {
+  // a navigation moves the on-screen Session: that is uiSession's snapshot,
+  // not a field on the sessions list
+  mainUiSession.setKey('b');
   for (const listener of sessionListeners) listener();
   await Promise.resolve();
   await Promise.resolve();
@@ -251,6 +276,80 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
   window.fetch = previousFetch;
   globalThis.fetch = window.fetch;
   restoreBlank();
+}
+
+/* The two sources of the on-screen Session, each on its own. `uiSession` is
+   authoritative; the legacy `sessions.list.current` field is kept working for a
+   dsh that still publishes it, but it must never be the reason a control
+   appears when the real binding says otherwise. */
+{
+  // Stable snapshot identities: `useSyncExternalStore` re-renders forever when a
+  // reader builds a fresh object per call. The real stores own their objects.
+  const noWorkspaces = { items: [], phase: 'ready' };
+  const mkSnapshot = (extra) => ({ byId: { s1: { cwd: '/repo-x', title: 'X' } }, ids: ['s1'], ...extra, phase: 'ready' });
+  const withLegacyCurrent = mkSnapshot({ current: 's1' });
+  const withoutLegacyCurrent = mkSnapshot({});
+  const cases = [
+    {
+      label: 'uiSession binding supplies the on-screen Session',
+      uiSession: stubUiSession('s1'),
+      snapshot: withoutLegacyCurrent,
+      expect: 's1',
+    },
+    {
+      label: 'the legacy sessions.list.current field still works when uiSession is absent',
+      uiSession: undefined,
+      snapshot: withLegacyCurrent,
+      expect: 's1',
+    },
+    {
+      label: 'a keyless uiSession binding resolves to nothing rather than a stale legacy id',
+      uiSession: stubUiSession(undefined),
+      snapshot: withLegacyCurrent,
+      expect: undefined,
+    },
+  ];
+  for (const { label, uiSession, snapshot, expect: expected } of cases) {
+    const restore = mod.__bwTest.setTestRuntime({
+      get: (name) => (name === 'uiSession' ? uiSession : undefined),
+      sessions: { list: { getSnapshot: () => snapshot, subscribe: () => () => {} } },
+      workspaces: {
+        list: { getSnapshot: () => noWorkspaces, subscribe: () => () => {} },
+      },
+    });
+    const previousFetch = window.fetch;
+    window.fetch = async (url) => {
+      const parsed = new URL(String(url), window.location.href);
+      if (parsed.pathname.endsWith('/detect')) {
+        return { json: async () => ({ ok: true, isGit: true, isLinkedWorktree: false, managed: false }) };
+      }
+      throw new Error(`unexpected request: ${parsed.pathname}${parsed.search}`);
+    };
+    globalThis.fetch = window.fetch;
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => { root.render(React.createElement(mod.__bwTest.HeroControl)); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    const source = mod.__bwTest.heroDebugState;
+    // the observable it settled on is the assertion: a visible control for the
+    // wrong Session would be worse than none
+    if (expected === undefined) {
+      assert.equal(source.mainViewKey, null, `${label}: no main-view key`);
+      assert.equal(container.querySelector('.dsh-bw-hero-label'), null, `${label}: nothing renders`);
+    } else {
+      const resolved = source.mainViewKey ?? source.legacyCurrent;
+      assert.equal(resolved, expected, `${label}: resolved Session id`);
+    }
+
+    await act(async () => { root.unmount(); });
+    container.remove();
+    window.fetch = previousFetch;
+    globalThis.fetch = window.fetch;
+    restore();
+  }
 }
 
 // Mount a real hook-using component. This covers effect setup/cleanup, request
@@ -526,7 +625,6 @@ assert.equal(document.querySelectorAll('style[data-plugin-css="dsh-better-worksp
  * these exercise the climb and the degrade path, not HeroControl).
  * ------------------------------------------------------------------ */
 const { createHeroInjector, nearestLayoutAncestor: climb, isHeroRow: heroRowish } = mod.__bwTest;
-
 // a display:contents outlet is skipped; the layout row behind it is returned
 {
   const row = document.createElement('div');
