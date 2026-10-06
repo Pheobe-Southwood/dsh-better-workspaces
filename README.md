@@ -9,7 +9,11 @@ Git workspace enhancements for the DeepSeek Harness Web GUI, inspired by
    a git repo, a mode dropdown appears in the hero row between the workspace
    chip and the 模式 control; it offers `本地` (the workspace root IS the
    repository checkout — the default) and `新建 worktree`, which reveals the
-   base-branch picker. Picking `本地` again leaves staging with no side effect,
+   base-branch picker. It shows as soon as the session belongs to that git
+   Workspace, **before the first message**: a blank session's own `cwd` is still
+   undefined at that point, so the directory is read off the Workspace that owns
+   the session — the same source the official picker derives its label from.
+   Picking `本地` again leaves staging with no side effect,
    so the picker is never a dead end, and the trigger label always shows the
    active mode. **The picker speaks exact refs (paseo parity)**: the
    `origin/<name>` row comes first because it IS the default base — cutting
@@ -231,6 +235,74 @@ curl -s http://127.0.0.1:3099/better-workspaces/api/worktree-workspaces
 checkout — what a user gets from `github:cup113/dsh-better-workspaces` — and
 your working tree stays untouched. Then remove the probe worktree
 (`git worktree remove "$snap"`).
+
+**Two footguns in that recipe, both learned the hard way.**
+
+`link:` is for probing only. The profile's correctness then depends on a
+directory that lives outside it, so **the moment the snapshot is deleted the
+plugin's manifest becomes unreadable** and the Plugins page renders
+`包元信息错误: Plugin metadata for dsh-better-workspaces: … ENOENT: no such file
+or directory, open '/…/package.json'` — the plugin itself keeps running, only
+its display metadata breaks. Always replace the probe with the published spec
+(same command without the `link:`) before walking away, and only then remove the
+snapshot.
+
+The **rendered UI must be looked at**, because DOM-injection degradation is
+silent by design (ADR 0001). The offline suites build their own DOM and
+therefore cannot see the slot framework's wrappers — a slot's `parentElement` is
+the renderer's `display: contents` anchor, *not* the layout row containing it
+(ADR 0001 Amendment 2).
+
+**A control that renders is not a control that works.** The hero worktree button
+appeared, was enabled, armed itself with a branch name, and still did nothing for
+a whole session: the on-screen Session was read from `sessions.list.current`, a
+field `dsh-api-session-controller` never publishes, so the create guard returned
+silently *before* the request, the busy state and the error (ADR 0015). When a
+click produces neither a request nor a message, check `__dshBwDebug.hero()`
+(`lastCwd`, `lastGuard`) and then the network panel — a missing request names the
+bug class.
+
+Ask the plugin itself instead of inferring from the DOM, using the read-only
+diagnostic surface it installs while mounted:
+
+```js
+window.__dshBwDebug.describeOnScreen()
+// { currentId, sessionCwd, resolvedCwd, source, owningWorkspacePath,
+//   lastGuard: { visible, noCwd, noDetect, notGit, linkedWorktree },
+//   lastDetect, rowFound, controlCount }
+```
+
+`source` names the tier that supplied the directory — `'session'` for the
+session's own cwd, `'workspace'` for the path of the Workspace that owns it,
+which is what a blank session has before its first message — and `lastGuard`
+names exactly which term of the visibility test decided the outcome. Pair it
+with `probe()`, which reports the DOM the injector actually saw:
+
+```js
+window.__dshBwDebug.probe()
+// dom: { rowCount, rowFound, rowChildren:[{cls,dataSlot,display,text}], slotTags, controls:[...] }
+// resolution: the fields describeOnScreen reports
+```
+
+Which reading means what:
+
+| `rowFound` | `controls[0]` | `resolvedCwd` | `lastGuard` | layer to fix |
+|---|---|---|---|---|
+| `false` | none | any | — | the hero row is not on screen; not a defect |
+| `true` | none | `null` | `noCwd` | resolution: neither the session nor its Workspace gives a directory |
+| `true` | none | set | `noDetect` | detection never settled for that cwd |
+| `true` | none | set | `notGit` / `linkedWorktree` | not an ordinary checkout; hiding is by design |
+| `true` | present, `width: 0` | set | `visible` | the control mounted but draws nothing |
+| `true` | absent, `visible` | set | `visible` | injection: the anchor moved |
+
+The rule that keeps this from becoming a rewrite: **no visible control while
+`lastGuard.visible === true` is an anchor bug; every other combination is decided
+before rendering.** This hook is a diagnostic, not a public API — it is
+read-only, removed with the plugin's effect, and carries no stability promise.
+
+If `window.__dshBwDebug` is missing, the browser is still running an older
+bundle: hard-refresh (Ctrl+Shift+R) before reading anything else, because the
+client bundle is assembled once when `dsh web` starts.
 
 ### Upgrading from a pre-bundle install (0.0.1)
 
