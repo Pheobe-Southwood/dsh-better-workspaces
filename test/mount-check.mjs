@@ -7,7 +7,9 @@
  * the exact cold-boot failure mode is visible without restarting dsh.
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const MODULES = [
   '../lib/git.js',
@@ -107,6 +109,166 @@ assert.ok(
   manifest.files?.includes(declaredPatch.replace(/^\.\//, '')),
   `package.json files must ship ${declaredPatch}: an npm publish would otherwise drop the only mount row`,
 );
+
+/* ---------------- client inject: a contract, not a comment ----------------
+ * `dsh.client.inject` is forwarded verbatim as the browser fiber's cordis
+ * `inject` list, so an entry nobody reads is a pure load-order wait edge, while
+ * a *missing* entry is a race: the client half resolves `conversation`,
+ * `uiSession`, `uiWorkspace` and `sidebarRight` lazily at render time.
+ *
+ * Packages that only arrive transitively (api-remotes, api-session-controller,
+ * api-workspace-controller, client-connection, client-locale, ui-sidebar) are
+ * deliberately NOT listed — they are already in the ui-workspace /
+ * ui-conversation / ui-session dependency closure, and the loader walks those
+ * edges before materializing the consumer.
+ */
+const clientSource = readFileSync(new URL('lib/client.js', packageRoot), 'utf8');
+const resolvedServices = new Set(
+  [...clientSource.matchAll(/(?:appCtx|[A-Za-z_$][\w$]*)\.get\("([a-zA-Z]+)"\)/g)].map((m) => m[1]),
+);
+// A client package registers a service either by extending the Service base
+// class (`super(ctx, "<name>")`) or through the context reflector
+// (`ctx.reflect.provide("<name>", impl)`). Both forms appear in the official
+// packages this plugin injects, so both must be recognized.
+const PROVIDES = /super\(\s*[A-Za-z_$][\w$]*\s*,\s*"([a-zA-Z]+)"\)|reflect\.provide\(\s*"([a-zA-Z]+)"/g;
+
+/** Service names a client bundle registers. */
+function providedServices(source) {
+  return [...source.matchAll(PROVIDES)].map((match) => match[1] ?? match[2]);
+}
+
+/**
+ * Check one inject list against the client half's service reads. `resolve` maps
+ * a package name to its directory, so the negative cases below run on stubs
+ * without an installed dsh; an unresolvable entry is skipped, because CI
+ * installs only this package.
+ */
+function checkInject(injectList, resolve) {
+  const errors = [];
+  const provided = new Set();
+  let inspected = 0;
+  for (const entry of injectList) {
+    const dir = resolve(entry);
+    if (dir === null) continue;
+    const clientEntry = new URL('lib/client.js', dir);
+    if (!existsSync(clientEntry)) continue;
+    inspected += 1;
+    const services = providedServices(readFileSync(clientEntry, 'utf8'));
+    if (!services.some((service) => resolvedServices.has(service))) {
+      errors.push(
+        `dsh.client.inject lists ${entry}, but it provides none of the services the client half resolves `
+          + `(${[...resolvedServices].join(', ')}); a load-order edge nobody reads is dead wiring`,
+      );
+    }
+    // NB: `Set.add` takes one argument — spreading this array would silently keep
+    // only its first service and report the rest as unprovided.
+    for (const service of services) provided.add(service);
+  }
+  return { errors, inspected, provided };
+}
+
+/**
+ * The converse rule: every service the client half reads must be reachable from
+ * a declared entry, or the read races that package's arrival. Separate from
+ * {@link checkInject} so the per-entry rule can be exercised on a stub covering
+ * one service rather than all four.
+ */
+function missingServiceErrors(provided, inspectable) {
+  if (!inspectable) return [];
+  return [...resolvedServices]
+    .filter((service) => !provided.has(service))
+    .map((service) => `the client half resolves "${service}", but no dsh.client.inject entry provides it: `
+      + 'the read would race that package\'s arrival');
+}
+
+/** Walk up from the repo so the check runs both in CI and inside a dsh install. */
+function nodeModulesRoots() {
+  const roots = [];
+  let dir = new URL('.', packageRoot);
+  for (let depth = 0; depth < 6; depth += 1) {
+    const candidate = new URL('node_modules/', dir);
+    if (existsSync(candidate)) roots.push(candidate);
+    const parent = new URL('../', dir);
+    if (parent.href === dir.href) break;
+    dir = parent;
+  }
+  return roots;
+}
+function packageDir(name) {
+  for (const root of nodeModulesRoots()) {
+    const candidate = new URL(`${name}/`, root);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+const injectList = manifest.dsh?.client?.inject ?? [];
+assert.ok(injectList.length > 0, 'dsh.client.inject must declare the services the client half resolves');
+
+const live = checkInject(injectList, packageDir);
+assert.deepEqual(live.errors, [], live.errors.join('\n'));
+assert.deepEqual(
+  missingServiceErrors(live.provided, live.inspected > 0),
+  [],
+  'every service the client half resolves must be provided by a declared entry',
+);
+if (live.inspected > 0) {
+  console.log(`inject check ok: ${injectList.length} declared, ${live.inspected} inspected, ${resolvedServices.size} services resolved`);
+} else {
+  console.log('inject check: no client packages installed here; exercising the rule on stubs instead');
+}
+
+/* The rule must actually bite, in both directions. Stub one entry that provides
+ * a service the client reads, and one that provides nothing it reads: the
+ * second is exactly the "comment pretending to be a dependency" this guards. */
+{
+  const stubRoot = mkdtempSync(join(tmpdir(), 'dsh-bw-inject-'));
+  const write = (name, service) => {
+    mkdirSync(join(stubRoot, name, 'lib'), { recursive: true });
+    writeFileSync(
+      join(stubRoot, name, 'lib', 'client.js'),
+      `window.__ModuleLoader__.load({ id: "${name}", factory: () => {\n`
+        + `\tclass X { constructor(ctx) { super(ctx, "${service}"); } }\n} });\n`,
+    );
+  };
+  write('stub-provider', 'uiSession');
+  write('stub-bystander', 'shoppingCart');
+  // the reflector form must be recognized too, or a real provider reads as a bystander
+  const writeReflector = (name, service) => {
+    mkdirSync(join(stubRoot, name, 'lib'), { recursive: true });
+    writeFileSync(
+      join(stubRoot, name, 'lib', 'client.js'),
+      `window.__ModuleLoader__.load({ id: "${name}", factory: (require) => {\n`
+        + `\tconst apply = (ctx) => ctx.reflect.provide("${service}", {});\n} });\n`,
+    );
+  };
+  writeReflector('stub-reflector', 'sidebarRight');
+  const stubResolve = (name) => (existsSync(join(stubRoot, name)) ? new URL(`file://${join(stubRoot, name)}/`) : null);
+
+  const good = checkInject(['stub-provider'], stubResolve);
+  assert.equal(good.inspected, 1, 'the stub package must be found and read');
+  assert.deepEqual(good.errors, [], `a provider of a resolved service must pass: ${good.errors.join('; ')}`);
+
+  const reflective = checkInject(['stub-reflector'], stubResolve);
+  assert.deepEqual(
+    reflective.errors,
+    [],
+    `ctx.reflect.provide must count as providing a service: ${reflective.errors.join('; ')}`,
+  );
+
+  const noisy = checkInject(['stub-provider', 'stub-bystander'], stubResolve);
+  assert.equal(noisy.errors.length, 1, 'exactly the unread entry must be reported');
+  assert.match(noisy.errors[0], /stub-bystander.*provides none/s);
+
+  const missing = missingServiceErrors(good.provided, true);
+  assert.ok(
+    missing.some((e) => /resolves "uiWorkspace".*no dsh\.client\.inject entry provides it/s.test(e)),
+    'a service no entry provides must be reported as a missing entry',
+  );
+  assert.deepEqual(missingServiceErrors(good.provided, false), [], 'an uninspectable install reports nothing');
+
+  rmSync(stubRoot, { recursive: true, force: true });
+}
 
 const patchSource = readFileSync(new URL(declaredPatch, packageRoot), 'utf8');
 assert.match(patchSource, /^\s*-\s*insert:/m, `${declaredPatch} must contribute a top-level insert list`);

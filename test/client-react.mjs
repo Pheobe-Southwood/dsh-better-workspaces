@@ -403,10 +403,10 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
   restoreBlank();
 }
 
-/* The two sources of the on-screen Session, each on its own. `uiSession` is
-   authoritative; the legacy `sessions.list.current` field is kept working for a
-   dsh that still publishes it, but it must never be the reason a control
-   appears when the real binding says otherwise. */
+/* `uiSession` is the one answer for the on-screen Session (ADR 0015). The legacy
+   `sessions.list.current` field is not published by dsh-api-session-controller
+   and must never be the reason a control appears — these cases pin that the
+   binding alone decides, in both directions. */
 {
   // Stable snapshot identities: `useSyncExternalStore` re-renders forever when a
   // reader builds a fresh object per call. The real stores own their objects.
@@ -422,10 +422,10 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
       expect: 's1',
     },
     {
-      label: 'the legacy sessions.list.current field still works when uiSession is absent',
+      label: 'a legacy sessions.list.current id is ignored when uiSession is absent',
       uiSession: undefined,
       snapshot: withLegacyCurrent,
-      expect: 's1',
+      expect: undefined,
     },
     {
       label: 'a keyless uiSession binding resolves to nothing rather than a stale legacy id',
@@ -465,8 +465,9 @@ const { heroCwdFor, heroControlKey } = mod.__bwTest;
       assert.equal(source.mainViewKey, null, `${label}: no main-view key`);
       assert.equal(container.querySelector('.dsh-bw-hero-label'), null, `${label}: nothing renders`);
     } else {
-      const resolved = source.mainViewKey ?? source.legacyCurrent;
-      assert.equal(resolved, expected, `${label}: resolved Session id`);
+      // uiSession's binding.key is the only authority (ADR 0015): there is no
+      // second source to fall back to, so this equality is the whole assertion.
+      assert.equal(source.mainViewKey, expected, `${label}: resolved Session id`);
     }
 
     await act(async () => { root.unmount(); });

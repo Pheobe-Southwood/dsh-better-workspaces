@@ -21,7 +21,7 @@ const { commitAction, pullAction, pushAction, discardAction, updateFromBaseActio
 const { createGitStateHub } = await import('../lib/state.js');
 const { createApi, API_PREFIX } = await import('../lib/api.js');
 const { listForgeItems, pullRequestDetail, invalidateGhAuth, invalidateForgeList, ghAvailable, parseGithubRemote, prStatus, prStatusBatch, invalidatePr, createPullRequest, mergePullRequest, disableAutoMerge } = await import('../lib/forge.js');
-const { createCleanupScheduler, createCreationSourceGuard, createExactWorkspaceDelete, createWorkspaceArchiveGuard } = await import('../lib/index.js');
+const { createCleanupScheduler, createCreationSourceGuard, assertWorkspaceArchivable, deleteWorkspace } = await import('../lib/index.js');
 const { hostMutationCoordinator } = await import('../lib/mutation.js');
 const { createWorkspaceAuthorizer } = await import('../lib/authorize.js');
 
@@ -1429,9 +1429,8 @@ await test('creation source guard binds the Host Session identity to cwd', async
 });
 
 await test('production archive guard disables physical deletion without a retiring lease', async () => {
-  const guard = createWorkspaceArchiveGuard();
-  await assert.rejects(guard('workspace-visible', '/repo/worktree'), /physical archive is disabled/);
-  await assert.rejects(guard(null, '/repo/unregistered-worktree'), /physical archive is disabled/,
+  await assert.rejects(assertWorkspaceArchivable('workspace-visible', '/repo/worktree'), /physical archive is disabled/);
+  await assert.rejects(assertWorkspaceArchivable(null, '/repo/unregistered-worktree'), /physical archive is disabled/,
     'unregistered managed worktrees cannot bypass the Session/Agent admission fence');
 });
 
@@ -1451,7 +1450,8 @@ await test('exact Workspace deletion is session-safe, target-only, and retry-ide
       return true;
     },
   };
-  const removeExact = createExactWorkspaceDelete(registry);
+  const removeExact = (workspaceId, expectedPath, capturedSessionIds) =>
+    deleteWorkspace(registry, workspaceId, expectedPath, capturedSessionIds);
   await assert.rejects(removeExact(target.id, target.path, ['session-target']), /raw durable membership/,
     'captured membership cannot be proven complete, so the exact row is retained');
   await assert.rejects(removeExact(target.id, '/replacement', ['session-target']), /no longer matches/);
